@@ -12,6 +12,9 @@
 #include <include/cef_load_handler.h>
 #include <include/wrapper/cef_helpers.h>
 
+#ifdef _WIN32
+class D3D11TextureReader;
+#endif
 
 G_BEGIN_DECLS
 
@@ -66,6 +69,10 @@ struct _GstCefSrc {
   GCond state_cond;
   GMutex state_lock;
   CefSrcState state;
+
+#ifdef _WIN32
+  D3D11TextureReader* texture_reader;
+#endif
 };
 
 struct _GstCefSrcClass {
@@ -80,6 +87,7 @@ public:
                                      CefRefPtr<CefCommandLine> command_line) override;
 
   CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override;
+  void OnContextInitialized() override;
 #ifdef __APPLE__
   void OnScheduleMessagePumpWork(int64_t delay_ms) override;
 #endif
@@ -93,3 +101,4 @@ GType gst_cef_src_get_type (void);
 G_END_DECLS
 
 #endif /* __GST_CEF_SRC_H__ */
+
