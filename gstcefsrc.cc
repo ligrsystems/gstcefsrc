@@ -19,6 +19,10 @@
 
 #include "gstcefsrc.h"
 #include "gstcefaudiometa.h"
+#ifdef _WIN32
+#include "d3d11_texture_reader.h"
+#include <objbase.h>
+#endif
 #ifdef __APPLE__
 #include "gstcefloader.h"
 #include "gstcefnsapplication.h"
@@ -71,6 +75,7 @@ static const guint8 CEF_STATUS_MASK_TRANSITIONING = CEF_STATUS_INITIALIZING;
 
 static GMutex init_lock;
 static GCond init_cond;
+static gboolean context_initialized = FALSE;
 
 #ifdef __APPLE__
 // On every timeout, the CEF event handler will be run in the context
@@ -115,6 +120,13 @@ static gint gst_cef_log_severity_from_str (const gchar *str)
   }
 
   return -1;
+}
+
+static gboolean
+gst_cef_switch_allows_comma_value (const gchar *name)
+{
+  return g_strcmp0 (name, "enable-features") == 0 ||
+      g_strcmp0 (name, "disable-features") == 0;
 }
 
 enum
@@ -278,6 +290,58 @@ class RenderHandler : public CefRenderHandler
       GST_LOG_OBJECT (src, "done painting");
     }
 
+#ifdef _WIN32
+    void OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                            PaintElementType type,
+                            const RectList& dirtyRects,
+                            const CefAcceleratedPaintInfo& info) override
+    {
+      if (type != PET_VIEW) return;
+
+      if (!src->texture_reader) {
+        src->texture_reader = new D3D11TextureReader();
+      }
+
+      int width = GST_VIDEO_INFO_WIDTH(&src->vinfo);
+      int height = GST_VIDEO_INFO_HEIGHT(&src->vinfo);
+
+      if (width <= 0 || height <= 0) return;
+
+      const void* pixels = nullptr;
+      int stride = 0;
+
+      if (!src->texture_reader->ReadTexture(
+              info.shared_texture_handle, width, height, &pixels, &stride)) {
+        GST_ERROR_OBJECT(src, "D3D11 shared texture readback failed");
+        return;
+      }
+
+      // Allocate GstBuffer and copy pixels row-by-row (GPU staging textures
+      // may have row padding, so stride can exceed width*4).
+      gsize row_bytes = (gsize)width * 4;
+      gsize packed_size = row_bytes * height;
+      GstBuffer* new_buffer = gst_buffer_new_allocate(nullptr, packed_size, nullptr);
+      {
+          GstMapInfo map;
+          gst_buffer_map(new_buffer, &map, GST_MAP_WRITE);
+          const uint8_t* src_row = static_cast<const uint8_t*>(pixels);
+          uint8_t* dst_row = map.data;
+          for (int y = 0; y < height; y++, src_row += stride, dst_row += row_bytes)
+              memcpy(dst_row, src_row, row_bytes);
+          gst_buffer_unmap(new_buffer, &map);
+      }
+
+      src->texture_reader->Release();
+
+      GST_OBJECT_LOCK (src);
+      gst_buffer_replace (&(src->current_buffer), new_buffer);
+      gst_buffer_unref (new_buffer);
+      GST_OBJECT_UNLOCK (src);
+
+      GST_LOG_OBJECT(src, "OnAcceleratedPaint frame: %dx%d stride=%d", width, height, stride);
+    }
+#endif
+
   private:
 
     GstCefSrc *src;
@@ -407,6 +471,23 @@ private:
   IMPLEMENT_REFCOUNTING(DisplayHandler);
 };
 
+static void
+gst_cef_load_url_on_ui_thread (CefRefPtr<CefBrowser> browser, std::string url)
+{
+  CEF_REQUIRE_UI_THREAD();
+  if (!browser) return;
+  CefRefPtr<CefFrame> frame = browser->GetMainFrame();
+  if (frame) frame->LoadURL(url);
+}
+
+static void
+gst_cef_close_browser_on_ui_thread (CefRefPtr<CefBrowser> browser)
+{
+  CEF_REQUIRE_UI_THREAD();
+  if (!browser) return;
+  browser->GetHost()->CloseBrowser(true);
+}
+
 class BrowserClient :
   public CefClient,
   public CefLifeSpanHandler,
@@ -483,6 +564,14 @@ class BrowserClient :
         browser_msg_handler_.reset(new MessageHandler(src));
         browser_msg_router_->AddHandler(browser_msg_handler_.get(), false);
       }
+
+      browser->GetHost()->SetAudioMuted(true);
+
+      g_mutex_lock (&src->state_lock);
+      src->browser = browser;
+      src->state = src->listen_for_js_signals ? CEF_SRC_WAITING_FOR_READY : CEF_SRC_OPEN;
+      g_cond_signal (&src->state_cond);
+      g_mutex_unlock(&src->state_lock);
     }
 
     virtual void OnBeforeClose(CefRefPtr<CefBrowser> browser) override
@@ -525,11 +614,21 @@ class BrowserClient :
     void MakeBrowser(int)
     {
       CefWindowInfo window_info;
-      CefRefPtr<CefBrowser> browser;
       CefBrowserSettings browser_settings;
 
+      // CefStructBase::init() sets window_info.size = sizeof(cef_window_info_t)
+      // Do NOT override with sizeof(CefWindowInfo) -- the C++ wrapper is larger
+      // due to CefStructBase overhead, and CEF rejects mismatched sizes.
       window_info.SetAsWindowless(0);
-      browser = CefBrowserHost::CreateBrowserSync(
+
+#ifdef _WIN32
+      if (src->gpu) {
+        window_info.shared_texture_enabled = true;
+        GST_INFO_OBJECT(src, "Hardware acceleration enabled: shared_texture_enabled=true");
+      }
+#endif
+
+      CefRefPtr<CefBrowser> browser = CefBrowserHost::CreateBrowserSync(
         window_info,
         this,
         std::string(src->url),
@@ -538,13 +637,14 @@ class BrowserClient :
         nullptr
       );
 
-      browser->GetHost()->SetAudioMuted(true);
-
-      g_mutex_lock (&src->state_lock);
-      src->browser = browser;
-      src->state = src->listen_for_js_signals ? CEF_SRC_WAITING_FOR_READY : CEF_SRC_OPEN;
-      g_cond_signal (&src->state_cond);
-      g_mutex_unlock(&src->state_lock);
+      if (!browser) {
+        GST_ERROR_OBJECT (src, "Failed to create CEF browser (CreateBrowserSync returned null)");
+        g_mutex_lock (&src->state_lock);
+        src->state = CEF_SRC_OPEN;
+        g_cond_signal (&src->state_cond);
+        g_mutex_unlock(&src->state_lock);
+      }
+      // On success, OnAfterCreated will fire and set src->browser
     }
 
   private:
@@ -567,6 +667,17 @@ class BrowserClient :
 
 BrowserApp::BrowserApp(GstCefSrc *src) : src(src)
 {
+}
+
+void BrowserApp::OnContextInitialized()
+{
+  CEF_REQUIRE_UI_THREAD();
+  GST_INFO_OBJECT(src, "CEF context initialized - message loop is running");
+
+  g_mutex_lock (&init_lock);
+  context_initialized = TRUE;
+  g_cond_broadcast (&init_cond);
+  g_mutex_unlock (&init_lock);
 }
 
 CefRefPtr<CefBrowserProcessHandler> BrowserApp::GetBrowserProcessHandler()
@@ -637,20 +748,53 @@ void BrowserApp::OnBeforeCommandLineProcessing(const CefString &process_type,
 
     if (extra_flags) {
       gchar **flags_list = g_strsplit (extra_flags, ",", -1);
+      gchar *pending_switch = NULL;
+      gchar *pending_value = NULL;
       guint i;
 
       for (i = 0; i < g_strv_length (flags_list); i++) {
-        gchar **switch_value = g_strsplit ((const gchar *) flags_list[i], "=", -1);
+        gchar *token = g_strstrip (flags_list[i]);
+        if (!token || !*token) continue;
 
-        if (g_strv_length (switch_value) > 1) {
-          GST_INFO_OBJECT (src, "Adding switch with value %s=%s", switch_value[0], switch_value[1]);
-          command_line->AppendSwitchWithValue (switch_value[0], switch_value[1]);
+        gchar *equals = strchr (token, '=');
+        if (equals != NULL) {
+          *equals = '\0';
+          const gchar *switch_name = token;
+          const gchar *switch_value = equals + 1;
+
+          if (pending_switch) {
+            GST_INFO_OBJECT (src, "Adding switch with value %s=%s", pending_switch, pending_value);
+            command_line->AppendSwitchWithValue (pending_switch, pending_value);
+            g_free (pending_switch);
+            g_free (pending_value);
+            pending_switch = NULL;
+            pending_value = NULL;
+          }
+
+          if (gst_cef_switch_allows_comma_value (switch_name)) {
+            pending_switch = g_strdup (switch_name);
+            pending_value = g_strdup (switch_value);
+          } else {
+            GST_INFO_OBJECT (src, "Adding switch with value %s=%s", switch_name, switch_value);
+            command_line->AppendSwitchWithValue (switch_name, switch_value);
+          }
         } else {
-          GST_INFO_OBJECT (src, "Adding flag %s", flags_list[i]);
-          command_line->AppendSwitch (flags_list[i]);
+          if (pending_switch) {
+            gchar *combined = g_strdup_printf ("%s,%s", pending_value, token);
+            g_free (pending_value);
+            pending_value = combined;
+          } else {
+            GST_INFO_OBJECT (src, "Adding flag %s", token);
+            command_line->AppendSwitch (token);
+          }
         }
+      }
 
-        g_strfreev (switch_value);
+      if (pending_switch) {
+        GST_INFO_OBJECT (src, "Adding switch with value %s=%s", pending_switch, pending_value);
+        command_line->AppendSwitchWithValue (pending_switch, pending_value);
+        g_free (pending_switch);
+        g_free (pending_value);
       }
 
       g_strfreev (flags_list);
@@ -702,7 +846,12 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
 static gpointer
 init_cef (GstCefSrc *src)
 {
+  /* Reset context_initialized for this CEF lifecycle */
+  g_mutex_lock (&init_lock);
+  context_initialized = FALSE;
+  g_mutex_unlock (&init_lock);
 #ifdef G_OS_WIN32
+  CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   HINSTANCE hInstance = GetModuleHandle(NULL);
   CefMainArgs args(hInstance);
 #else
@@ -734,7 +883,7 @@ init_cef (GstCefSrc *src)
     cef_cache_location = g_getenv ("GST_CEF_CACHE_LOCATION");
   }
 
-  bool sandbox = src->gpu || (!!g_getenv ("GST_CEF_SANDBOX"));
+  bool sandbox = src->sandbox || (!!g_getenv ("GST_CEF_SANDBOX"));
 
   settings.no_sandbox = !sandbox;
   settings.windowless_rendering_enabled = true;
@@ -762,7 +911,7 @@ init_cef (GstCefSrc *src)
 #ifdef __APPLE__
   gchar* browser_subprocess_path = g_build_filename(base_path, "gstcefsubprocess.app/Contents/MacOS/gstcefsubprocess", nullptr);
 #else
-  gchar* browser_subprocess_path = g_build_filename(base_path, "gstcefsubprocess", nullptr);
+  gchar* browser_subprocess_path = g_build_filename(base_path, "gstcefsubprocess.exe", nullptr);
 #endif
   if (const gchar *custom_subprocess_path = g_getenv ("GST_CEF_SUBPROCESS_PATH")) {
     g_setenv ("CEF_SUBPROCESS_PATH", browser_subprocess_path, TRUE);
@@ -801,16 +950,38 @@ init_cef (GstCefSrc *src)
   gchar *locales_dir_path = g_build_filename(base_path, "locales", nullptr);
   CefString(&settings.locales_dir_path).FromASCII(locales_dir_path);
 
+  // CEF 139 requires resources_dir_path to find .pak files
+  CefString(&settings.resources_dir_path).FromASCII(base_path);
+
   if (js_flags != NULL) {
     CefString(&settings.javascript_flags).FromASCII(js_flags);
   }
 
   if (cef_cache_location != NULL) {
     CefString(&settings.cache_path).FromASCII(cef_cache_location);
+    CefString(&settings.root_cache_path).FromASCII(cef_cache_location);
   }
 
   g_free(base_path);
   g_free(locales_dir_path);
+
+  // Set root_cache_path (required by CEF 139)
+  const gchar *root_cache_path = g_getenv("GST_CEF_ROOT_CACHE_PATH");
+  if (root_cache_path) {
+    CefString(&settings.root_cache_path).FromASCII(root_cache_path);
+    GST_INFO_OBJECT(src, "Setting root_cache_path=%s", root_cache_path);
+    if (!cef_cache_location) {
+      // If cache_path not set, use root_cache_path as cache_path too
+      CefString(&settings.cache_path).FromASCII(root_cache_path);
+      GST_INFO_OBJECT(src, "Also setting cache_path=%s", root_cache_path);
+    }
+  }
+
+  // Enable CEF debug log to file
+  gchar *cef_log_path = g_build_filename(root_cache_path ? root_cache_path : ".", "cef_debug.log", nullptr);
+  CefString(&settings.log_file).FromASCII(cef_log_path);
+  GST_INFO_OBJECT(src, "CEF log file: %s", cef_log_path);
+  g_free(cef_log_path);
 
   app = new BrowserApp(src);
 
@@ -910,11 +1081,24 @@ gst_cef_src_start(GstBaseSrc *base_src)
 
   CefRefPtr<BrowserClient> browserClient = new BrowserClient(src);
 
-  /* Make sure CEF is initialized before posting a task */
+    /* Make sure CEF is initialized before posting a task */
   g_mutex_lock (&init_lock);
   while (cef_status & ~CEF_STATUS_MASK_INITIALIZED)
     g_cond_wait (&init_cond, &init_lock);
   g_mutex_unlock (&init_lock);
+
+  if (cef_status == CEF_STATUS_FAILURE) {
+    GST_ELEMENT_PROGRESS(src, ERROR, "open", ("CEF in failed state (early check)"));
+    goto done;
+  }
+
+  /* Wait for OnContextInitialized - message loop must be running before CreateBrowser */
+  GST_INFO_OBJECT(src, "Waiting for CEF context initialization (message loop)...");
+  g_mutex_lock (&init_lock);
+  while (!context_initialized)
+    g_cond_wait (&init_cond, &init_lock);
+  g_mutex_unlock (&init_lock);
+  GST_INFO_OBJECT(src, "CEF context initialized, proceeding with browser creation");
 
   if (cef_status == CEF_STATUS_FAILURE) {
     GST_ELEMENT_PROGRESS(src, ERROR, "open", ("CEF in failed state"));
@@ -977,7 +1161,8 @@ done:
 static void
 gst_cef_src_close_browser(GstCefSrc *src)
 {
-  src->browser->GetHost()->CloseBrowser(true);
+  CefPostTask (TID_UI,
+      base::BindOnce (&gst_cef_close_browser_on_ui_thread, src->browser));
 }
 
 static gboolean
@@ -1077,25 +1262,28 @@ gst_cef_src_set_caps (GstBaseSrc * base_src, GstCaps * caps)
   GstCefSrc *src = GST_CEF_SRC (base_src);
   gboolean ret = TRUE;
   GstBuffer *new_buffer;
-  gint fps;
-  CefRefPtr<CefBrowser> browser;
 
   GST_INFO_OBJECT (base_src, "Caps set to %" GST_PTR_FORMAT, caps);
 
   GST_OBJECT_LOCK (src);
   gst_video_info_from_caps (&src->vinfo, caps);
-  fps = gst_util_uint64_scale (1, src->vinfo.fps_n, src->vinfo.fps_d);
   new_buffer = gst_buffer_new_allocate (NULL, src->vinfo.width * src->vinfo.height * 4, NULL);
   gst_buffer_replace (&(src->current_buffer), new_buffer);
   gst_buffer_unref (new_buffer);
-  browser = src->browser;
-  GST_OBJECT_UNLOCK (src);
-
-  if (browser) {
-    browser->GetHost()->SetWindowlessFrameRate(fps);
-    browser->GetHost()->WasResized();
-    browser->GetHost()->Invalidate(PET_VIEW);
+  if (src->browser) {
+    CefRefPtr<CefBrowser> browser = src->browser;
+    int fps = (int)gst_util_uint64_scale (1, src->vinfo.fps_n, src->vinfo.fps_d);
+    CefPostTask (TID_UI,
+        base::BindOnce ([](CefRefPtr<CefBrowser> b, int rate) {
+          CEF_REQUIRE_UI_THREAD();
+          if (b && b->GetHost()) {
+            b->GetHost()->SetWindowlessFrameRate(rate);
+            b->GetHost()->WasResized();
+            b->GetHost()->Invalidate(PET_VIEW);
+          }
+        }, browser, fps));
   }
+  GST_OBJECT_UNLOCK (src);
 
   return ret;
 }
@@ -1110,7 +1298,6 @@ gst_cef_src_set_property (GObject * object, guint prop_id, const GValue * value,
     case PROP_URL:
     {
       const gchar *url;
-      CefRefPtr<CefBrowser> browser;
 
       url = g_value_get_string (value);
       g_free (src->url);
@@ -1118,12 +1305,12 @@ gst_cef_src_set_property (GObject * object, guint prop_id, const GValue * value,
 
       g_mutex_lock(&src->state_lock);
       if (CefSrcStateIsOpen(src->state) && src->browser) {
-        browser = src->browser;
+        CefPostTask (TID_UI,
+            base::BindOnce (&gst_cef_load_url_on_ui_thread,
+                src->browser,
+                std::string (src->url)));
       }
       g_mutex_unlock(&src->state_lock);
-      if (browser) {
-        browser->GetMainFrame()->LoadURL(src->url);
-      }
 
       break;
     }
@@ -1255,6 +1442,13 @@ gst_cef_src_finalize (GObject *object)
 {
   GstCefSrc *src = GST_CEF_SRC (object);
 
+#ifdef _WIN32
+  if (src->texture_reader) {
+    delete src->texture_reader;
+    src->texture_reader = nullptr;
+  }
+#endif
+
   if (src->audio_buffers) {
     gst_buffer_list_unref (src->audio_buffers);
     src->audio_buffers = NULL;
@@ -1280,7 +1474,15 @@ gst_cef_src_init (GstCefSrc * src)
   src->audio_buffers = NULL;
   src->audio_events = NULL;
   src->state = CEF_SRC_CLOSED;
+#ifdef _WIN32
+  src->texture_reader = nullptr;
+#endif
   src->chromium_debug_port = DEFAULT_CHROMIUM_DEBUG_PORT;
+
+  /* Default video info so GetViewRect returns sensible values before caps */
+  gst_video_info_set_format(&src->vinfo, GST_VIDEO_FORMAT_BGRA, DEFAULT_WIDTH, DEFAULT_HEIGHT);
+  src->vinfo.fps_n = DEFAULT_FPS_N;
+  src->vinfo.fps_d = DEFAULT_FPS_D;
   src->sandbox = DEFAULT_SANDBOX;
   src->listen_for_js_signals = DEFAULT_LISTEN_FOR_JS_SIGNALS;
   src->js_flags = NULL;
