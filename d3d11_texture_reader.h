@@ -43,6 +43,18 @@ public:
             if (FAILED(hr)) return false;
         }
 
+        // Validate shared texture format/dimensions before CopyResource
+        D3D11_TEXTURE2D_DESC shared_desc = {};
+        shared_tex->GetDesc(&shared_desc);
+        if (shared_desc.Width != (UINT)width ||
+            shared_desc.Height != (UINT)height ||
+            (shared_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+             shared_desc.Format != DXGI_FORMAT_B8G8R8X8_UNORM)) {
+            // Format/size mismatch — recreate staging to match actual texture
+            if (!EnsureStaging(shared_desc.Width, shared_desc.Height))
+                return false;
+        }
+
         // Copy shared texture to staging texture
         context_->CopyResource(staging_.Get(), shared_tex.Get());
 
