@@ -46,12 +46,19 @@ public:
         // Validate shared texture format/dimensions before CopyResource
         D3D11_TEXTURE2D_DESC shared_desc = {};
         shared_tex->GetDesc(&shared_desc);
+        if (shared_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+            shared_desc.Format != DXGI_FORMAT_B8G8R8X8_UNORM) {
+            // Unsupported format — would produce color-corrupt output
+            return false;
+        }
         if (shared_desc.Width != (UINT)width ||
-            shared_desc.Height != (UINT)height ||
-            (shared_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
-             shared_desc.Format != DXGI_FORMAT_B8G8R8X8_UNORM)) {
-            // Format/size mismatch — recreate staging to match actual texture
-            if (!EnsureStaging(shared_desc.Width, shared_desc.Height, shared_desc.Format))
+            shared_desc.Height != (UINT)height) {
+            // Dimension mismatch — skip frame, caller expects exact dimensions
+            return false;
+        }
+        if (shared_desc.Format != staging_format_) {
+            // Format changed but dimensions match — recreate staging
+            if (!EnsureStaging(width, height, shared_desc.Format))
                 return false;
         }
 

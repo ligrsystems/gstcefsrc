@@ -323,7 +323,12 @@ class RenderHandler : public CefRenderHandler
       GstBuffer* new_buffer = gst_buffer_new_allocate(nullptr, packed_size, nullptr);
       {
           GstMapInfo map;
-          gst_buffer_map(new_buffer, &map, GST_MAP_WRITE);
+          if (!new_buffer || !gst_buffer_map(new_buffer, &map, GST_MAP_WRITE)) {
+              GST_ERROR_OBJECT(src, "Failed to map GstBuffer for GPU frame");
+              if (new_buffer) gst_buffer_unref(new_buffer);
+              src->texture_reader->Release();
+              return;
+          }
           const uint8_t* src_row = static_cast<const uint8_t*>(pixels);
           uint8_t* dst_row = map.data;
           for (int y = 0; y < height; y++, src_row += stride, dst_row += row_bytes)
@@ -1003,6 +1008,9 @@ init_cef (GstCefSrc *src)
   g_mutex_unlock (&init_lock);
 #ifndef __APPLE__
   CefRunMessageLoop();
+#ifdef _WIN32
+  CoUninitialize();
+#endif
 #endif
 
 done:
@@ -1095,7 +1103,7 @@ gst_cef_src_start(GstBaseSrc *base_src)
   /* Wait for OnContextInitialized - message loop must be running before CreateBrowser */
   GST_INFO_OBJECT(src, "Waiting for CEF context initialization (message loop)...");
   g_mutex_lock (&init_lock);
-  while (!context_initialized)
+  while (!context_initialized && cef_status != CEF_STATUS_FAILURE)
     g_cond_wait (&init_cond, &init_lock);
   g_mutex_unlock (&init_lock);
   GST_INFO_OBJECT(src, "CEF context initialized, proceeding with browser creation");
