@@ -25,7 +25,7 @@ public:
     bool ReadTexture(HANDLE shared_handle, int width, int height,
                      const void** out_data, int* out_stride) {
         if (!EnsureDevice()) return false;
-        if (!EnsureStaging(width, height)) return false;
+        if (!EnsureStaging(width, height, DXGI_FORMAT_B8G8R8A8_UNORM)) return false;
 
         // Open shared texture
         ComPtr<ID3D11Texture2D> shared_tex;
@@ -51,7 +51,7 @@ public:
             (shared_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
              shared_desc.Format != DXGI_FORMAT_B8G8R8X8_UNORM)) {
             // Format/size mismatch — recreate staging to match actual texture
-            if (!EnsureStaging(shared_desc.Width, shared_desc.Height))
+            if (!EnsureStaging(shared_desc.Width, shared_desc.Height, shared_desc.Format))
                 return false;
         }
 
@@ -84,6 +84,7 @@ private:
     ComPtr<ID3D11Texture2D>     staging_;
     int staging_width_ = 0;
     int staging_height_ = 0;
+    DXGI_FORMAT staging_format_ = DXGI_FORMAT_UNKNOWN;
     bool mapped_ = false;
 
     bool EnsureDevice() {
@@ -125,8 +126,9 @@ private:
         return true;
     }
 
-    bool EnsureStaging(int width, int height) {
-        if (staging_ && staging_width_ == width && staging_height_ == height)
+    bool EnsureStaging(int width, int height, DXGI_FORMAT format) {
+        if (staging_ && staging_width_ == width && staging_height_ == height
+            && staging_format_ == format)
             return true;
 
         staging_.Reset();
@@ -136,7 +138,7 @@ private:
         desc.Height = height;
         desc.MipLevels = 1;
         desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.Format = format;
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_STAGING;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -146,6 +148,7 @@ private:
 
         staging_width_ = width;
         staging_height_ = height;
+        staging_format_ = format;
         return true;
     }
 };

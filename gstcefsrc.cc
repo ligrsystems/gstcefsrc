@@ -316,10 +316,20 @@ class RenderHandler : public CefRenderHandler
         return;
       }
 
-      // Allocate GstBuffer and copy pixels
-      gsize buf_size = height * stride;
-      GstBuffer* new_buffer = gst_buffer_new_allocate(nullptr, buf_size, nullptr);
-      gst_buffer_fill(new_buffer, 0, pixels, buf_size);
+      // Allocate GstBuffer and copy pixels row-by-row (GPU staging textures
+      // may have row padding, so stride can exceed width*4).
+      gsize row_bytes = (gsize)width * 4;
+      gsize packed_size = row_bytes * height;
+      GstBuffer* new_buffer = gst_buffer_new_allocate(nullptr, packed_size, nullptr);
+      {
+          GstMapInfo map;
+          gst_buffer_map(new_buffer, &map, GST_MAP_WRITE);
+          const uint8_t* src_row = static_cast<const uint8_t*>(pixels);
+          uint8_t* dst_row = map.data;
+          for (int y = 0; y < height; y++, src_row += stride, dst_row += row_bytes)
+              memcpy(dst_row, src_row, row_bytes);
+          gst_buffer_unmap(new_buffer, &map);
+      }
 
       src->texture_reader->Release();
 
@@ -873,7 +883,7 @@ init_cef (GstCefSrc *src)
     cef_cache_location = g_getenv ("GST_CEF_CACHE_LOCATION");
   }
 
-  bool sandbox = src->gpu || (!!g_getenv ("GST_CEF_SANDBOX"));
+  bool sandbox = src->sandbox || (!!g_getenv ("GST_CEF_SANDBOX"));
 
   settings.no_sandbox = !sandbox;
   settings.windowless_rendering_enabled = true;
