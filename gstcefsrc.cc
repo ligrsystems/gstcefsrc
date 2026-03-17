@@ -251,11 +251,24 @@ class RenderHandler : public CefRenderHandler
     void OnPaint(CefRefPtr<CefBrowser> browser, PaintElementType type, const RectList &dirtyRects, const void * buffer, int w, int h) override
     {
       GstBuffer *new_buffer;
+      guint target_width, target_height;
+      gsize target_size, source_size, copy_size;
 
       GST_LOG_OBJECT (src, "painting, width / height: %d %d", w, h);
 
-      new_buffer = gst_buffer_new_allocate (NULL, src->vinfo.width * src->vinfo.height * 4, NULL);
-      gst_buffer_fill (new_buffer, 0, buffer, w * h * 4);
+      GST_OBJECT_LOCK (src);
+      target_width = src->vinfo.width > 0 ? src->vinfo.width : (w > 0 ? (guint) w : (guint) DEFAULT_WIDTH);
+      target_height = src->vinfo.height > 0 ? src->vinfo.height : (h > 0 ? (guint) h : (guint) DEFAULT_HEIGHT);
+      GST_OBJECT_UNLOCK (src);
+
+      target_size = (gsize) target_width * (gsize) target_height * 4;
+      source_size = (w > 0 && h > 0) ? ((gsize) w * (gsize) h * 4) : 0;
+      copy_size = MIN (target_size, source_size);
+
+      new_buffer = gst_buffer_new_allocate (NULL, target_size, NULL);
+      gst_buffer_fill (new_buffer, 0, buffer, copy_size);
+      if (copy_size < target_size)
+        gst_buffer_memset (new_buffer, copy_size, 0, target_size - copy_size);
 
       GST_OBJECT_LOCK (src);
       gst_buffer_replace (&(src->current_buffer), new_buffer);
@@ -474,8 +487,8 @@ class BrowserClient :
 
     virtual void OnBeforeClose(CefRefPtr<CefBrowser> browser) override
     {
-      src->browser = nullptr;
       g_mutex_lock (&src->state_lock);
+      src->browser = nullptr;
       src->state = CEF_SRC_CLOSED;
       g_cond_signal (&src->state_cond);
       g_mutex_unlock(&src->state_lock);
@@ -527,9 +540,8 @@ class BrowserClient :
 
       browser->GetHost()->SetAudioMuted(true);
 
-      src->browser = browser;
-
       g_mutex_lock (&src->state_lock);
+      src->browser = browser;
       src->state = src->listen_for_js_signals ? CEF_SRC_WAITING_FOR_READY : CEF_SRC_OPEN;
       g_cond_signal (&src->state_cond);
       g_mutex_unlock(&src->state_lock);
@@ -942,7 +954,9 @@ gst_cef_src_start(GstBaseSrc *base_src)
     g_mutex_unlock (&src->state_lock);
   }
 
+  g_mutex_lock (&src->state_lock);
   ret = src->browser != NULL;
+  g_mutex_unlock (&src->state_lock);
 
   if (ret) {
     GST_ELEMENT_PROGRESS(
@@ -1063,17 +1077,25 @@ gst_cef_src_set_caps (GstBaseSrc * base_src, GstCaps * caps)
   GstCefSrc *src = GST_CEF_SRC (base_src);
   gboolean ret = TRUE;
   GstBuffer *new_buffer;
+  gint fps;
+  CefRefPtr<CefBrowser> browser;
 
   GST_INFO_OBJECT (base_src, "Caps set to %" GST_PTR_FORMAT, caps);
 
   GST_OBJECT_LOCK (src);
   gst_video_info_from_caps (&src->vinfo, caps);
+  fps = gst_util_uint64_scale (1, src->vinfo.fps_n, src->vinfo.fps_d);
   new_buffer = gst_buffer_new_allocate (NULL, src->vinfo.width * src->vinfo.height * 4, NULL);
   gst_buffer_replace (&(src->current_buffer), new_buffer);
   gst_buffer_unref (new_buffer);
-  src->browser->GetHost()->SetWindowlessFrameRate(gst_util_uint64_scale (1, src->vinfo.fps_n, src->vinfo.fps_d));
-  src->browser->GetHost()->WasResized();
+  browser = src->browser;
   GST_OBJECT_UNLOCK (src);
+
+  if (browser) {
+    browser->GetHost()->SetWindowlessFrameRate(fps);
+    browser->GetHost()->WasResized();
+    browser->GetHost()->Invalidate(PET_VIEW);
+  }
 
   return ret;
 }
@@ -1088,16 +1110,20 @@ gst_cef_src_set_property (GObject * object, guint prop_id, const GValue * value,
     case PROP_URL:
     {
       const gchar *url;
+      CefRefPtr<CefBrowser> browser;
 
       url = g_value_get_string (value);
       g_free (src->url);
       src->url = g_strdup (url);
 
       g_mutex_lock(&src->state_lock);
-      if (CefSrcStateIsOpen(src->state)) {
-        src->browser->GetMainFrame()->LoadURL(src->url);
+      if (CefSrcStateIsOpen(src->state) && src->browser) {
+        browser = src->browser;
       }
       g_mutex_unlock(&src->state_lock);
+      if (browser) {
+        browser->GetMainFrame()->LoadURL(src->url);
+      }
 
       break;
     }
