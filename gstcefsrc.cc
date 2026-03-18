@@ -27,6 +27,10 @@
 #include "gstcefloader.h"
 #include "gstcefnsapplication.h"
 #endif
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <unistd.h>
+#include <gst/allocators/gstdmabuf.h>
+#endif
 
 #define GST_ELEMENT_PROGRESS(el, type, code, text)      \
 G_STMT_START {                                          \
@@ -347,6 +351,106 @@ class RenderHandler : public CefRenderHandler
     }
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+    void OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
+                            PaintElementType type,
+                            const RectList& dirtyRects,
+                            const CefAcceleratedPaintInfo& info) override
+    {
+      if (type != PET_VIEW) return;
+
+      int width = GST_VIDEO_INFO_WIDTH(&src->vinfo);
+      int height = GST_VIDEO_INFO_HEIGHT(&src->vinfo);
+
+      if (width <= 0 || height <= 0) return;
+      if (info.plane_count <= 0 || info.plane_count > 4) {
+        GST_WARNING_OBJECT(src, "OnAcceleratedPaint: unexpected plane_count=%d", info.plane_count);
+        return;
+      }
+
+      // Lazily create the dmabuf allocator
+      if (!src->dmabuf_allocator) {
+        src->dmabuf_allocator = gst_dmabuf_allocator_new();
+        if (!src->dmabuf_allocator) {
+          GST_ERROR_OBJECT(src, "Failed to create DMA-BUF allocator");
+          return;
+        }
+      }
+
+      if (!src->accelerated_paint_active) {
+        src->accelerated_paint_active = TRUE;
+        GST_INFO_OBJECT(src, "OnAcceleratedPaint active: Linux DMA-BUF zero-copy path enabled "
+                         "(planes=%d, modifier=0x%" G_GINT64_MODIFIER "x, format=%d)",
+                         info.plane_count, info.modifier, info.format);
+      }
+
+      // Create a GstBuffer and attach each dmabuf plane.
+      // We dup() each fd because CEF's texture pool may recycle the underlying
+      // buffer after this callback returns. The dup'd fd holds a kernel-level
+      // reference to the dmabuf, keeping the GPU memory alive until GStreamer
+      // unrefs the buffer and the allocator closes our fd.
+      GstBuffer *new_buffer = gst_buffer_new();
+      gsize offsets[4] = {0};
+      gint strides[4] = {0};
+
+      for (int i = 0; i < info.plane_count; i++) {
+        int duped_fd = dup(info.planes[i].fd);
+        if (duped_fd < 0) {
+          GST_ERROR_OBJECT(src, "Failed to dup() dmabuf fd for plane %d (fd=%d): %s",
+                           i, info.planes[i].fd, g_strerror(errno));
+          gst_buffer_unref(new_buffer);
+          return;
+        }
+
+        // gst_dmabuf_allocator_alloc takes ownership of duped_fd and will
+        // close it when the GstMemory is freed.
+        GstMemory *mem = gst_dmabuf_allocator_alloc(
+            src->dmabuf_allocator,
+            duped_fd,
+            info.planes[i].size);
+
+        if (!mem) {
+          GST_ERROR_OBJECT(src, "gst_dmabuf_allocator_alloc failed for plane %d", i);
+          close(duped_fd);
+          gst_buffer_unref(new_buffer);
+          return;
+        }
+
+        // Set the memory offset within the dmabuf (for multi-plane formats
+        // where all planes share a single dmabuf fd)
+        mem->offset = info.planes[i].offset;
+
+        gst_buffer_append_memory(new_buffer, mem);
+
+        offsets[i] = info.planes[i].offset;
+        strides[i] = (gint)info.planes[i].stride;
+      }
+
+      // Add video metadata so downstream elements know the layout.
+      // CEF on Linux typically delivers BGRA (single plane).
+      GstVideoFormat gst_fmt = GST_VIDEO_FORMAT_BGRA;
+      // TODO: Map info.format (cef_color_type_t) to GstVideoFormat if CEF
+      // delivers other formats (e.g. RGBA, NV12). For now assume BGRA which
+      // matches the existing OnPaint output format.
+
+      gst_buffer_add_video_meta_full(new_buffer,
+          GST_VIDEO_FRAME_FLAG_NONE,
+          gst_fmt,
+          width, height,
+          info.plane_count,
+          offsets,
+          strides);
+
+      GST_OBJECT_LOCK (src);
+      gst_buffer_replace (&(src->current_buffer), new_buffer);
+      gst_buffer_unref (new_buffer);
+      GST_OBJECT_UNLOCK (src);
+
+      GST_LOG_OBJECT(src, "OnAcceleratedPaint dmabuf frame: %dx%d planes=%d modifier=0x%" G_GINT64_MODIFIER "x",
+                     width, height, info.plane_count, info.modifier);
+    }
+#endif
+
   private:
 
     GstCefSrc *src;
@@ -626,7 +730,7 @@ class BrowserClient :
       // due to CefStructBase overhead, and CEF rejects mismatched sizes.
       window_info.SetAsWindowless(0);
 
-#ifdef _WIN32
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
       if (src->gpu) {
         window_info.shared_texture_enabled = true;
         GST_INFO_OBJECT(src, "Hardware acceleration enabled: shared_texture_enabled=true");

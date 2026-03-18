@@ -16,6 +16,10 @@
 class D3D11TextureReader;
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <gst/allocators/gstdmabuf.h>
+#endif
+
 G_BEGIN_DECLS
 
 #define GST_TYPE_CEF_SRC \
@@ -72,6 +76,11 @@ struct _GstCefSrc {
 
 #ifdef _WIN32
   D3D11TextureReader* texture_reader;
+#endif
+
+#if defined(__linux__) && !defined(__ANDROID__)
+  GstAllocator *dmabuf_allocator;
+  gboolean accelerated_paint_active;
 #endif
 };
 

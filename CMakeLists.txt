@@ -93,7 +93,8 @@ endif()
 
 pkg_check_modules(GST REQUIRED gstreamer-1.0
                   gstreamer-video-1.0
-                  gstreamer-audio-1.0)
+                  gstreamer-audio-1.0
+                  gstreamer-allocators-1.0)
 
 if(USE_SANDBOX)
   message("Using the CEF sandbox.")
