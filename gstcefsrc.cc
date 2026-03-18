@@ -930,7 +930,19 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
   }
 
   g_assert (src->current_buffer);
-  *buf = gst_buffer_copy (src->current_buffer);
+
+#if defined(__linux__) && !defined(__ANDROID__)
+  if (src->accelerated_paint_active) {
+    // For dmabuf-backed buffers, we must NOT deep-copy — gst_buffer_copy would
+    // mmap the dmabuf and memcpy pixels to system memory, defeating zero-copy.
+    // Instead, take a ref to share the underlying dmabuf fd with downstream.
+    // The dup'd fd keeps the GPU memory alive until downstream unrefs.
+    *buf = gst_buffer_ref (src->current_buffer);
+  } else
+#endif
+  {
+    *buf = gst_buffer_copy (src->current_buffer);
+  }
 
   if (src->audio_buffers) {
     gst_buffer_add_cef_audio_meta (*buf, src->audio_buffers);
@@ -1561,6 +1573,13 @@ gst_cef_src_finalize (GObject *object)
   }
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+  if (src->dmabuf_allocator) {
+    gst_object_unref (src->dmabuf_allocator);
+    src->dmabuf_allocator = NULL;
+  }
+#endif
+
   if (src->audio_buffers) {
     gst_buffer_list_unref (src->audio_buffers);
     src->audio_buffers = NULL;
@@ -1588,6 +1607,10 @@ gst_cef_src_init (GstCefSrc * src)
   src->state = CEF_SRC_CLOSED;
 #ifdef _WIN32
   src->texture_reader = nullptr;
+#endif
+#if defined(__linux__) && !defined(__ANDROID__)
+  src->dmabuf_allocator = NULL;
+  src->accelerated_paint_active = FALSE;
 #endif
   src->chromium_debug_port = DEFAULT_CHROMIUM_DEBUG_PORT;
 
