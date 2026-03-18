@@ -976,7 +976,19 @@ init_cef (GstCefSrc *src)
   HINSTANCE hInstance = GetModuleHandle(NULL);
   CefMainArgs args(hInstance);
 #else
-  CefMainArgs args(0, NULL);
+  // Construct argv with Ozone platform flags.  Chromium selects the Ozone
+  // backend during very early static init — before OnBeforeCommandLineProcessing
+  // runs — so these MUST be in the real argv passed to CefMainArgs.
+  // The GST_CEF_OZONE_PLATFORM env var allows overriding (default: x11).
+  const gchar *ozone_platform = g_getenv("GST_CEF_OZONE_PLATFORM");
+  std::string ozone_flag = std::string("--ozone-platform=") +
+      (ozone_platform ? ozone_platform : "x11");
+
+  // Build a synthetic argv.  CEF copies argv internally so stack storage is fine.
+  char arg0[] = "gstcefsrc";
+  char *synth_argv[] = { arg0, const_cast<char *>(ozone_flag.c_str()), nullptr };
+  int   synth_argc   = 2;
+  CefMainArgs args(synth_argc, synth_argv);
 #endif
 
   CefSettings settings;
