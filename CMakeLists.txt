@@ -127,6 +127,11 @@ if(OS_WINDOWS)
   # D3D11 hardware-accelerated OSR requires these Windows SDK libraries
   target_link_libraries("gstcef" d3d11.lib dxgi.lib ole32.lib)
 endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # CUDA driver API for importing dmabuf fds into CUDA memory
+  find_package(CUDAToolkit REQUIRED)
+  target_link_libraries("gstcef" CUDA::cuda_driver)
+endif()
 target_include_directories("gstcef" PUBLIC ${GST_INCLUDE_DIRS})
 set_target_properties("gstcef" PROPERTIES INSTALL_RPATH "$ORIGIN")
 set_target_properties("gstcef" PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE)

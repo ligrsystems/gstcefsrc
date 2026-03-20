@@ -29,7 +29,9 @@
 #endif
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <unistd.h>
+#include <errno.h>
 #include <gst/allocators/gstdmabuf.h>
+#include <cuda.h>
 #endif
 
 #define GST_ELEMENT_PROGRESS(el, type, code, text)      \
@@ -368,86 +370,160 @@ class RenderHandler : public CefRenderHandler
         return;
       }
 
-      // Lazily create the dmabuf allocator
-      if (!src->dmabuf_allocator) {
-        src->dmabuf_allocator = gst_dmabuf_allocator_new();
-        if (!src->dmabuf_allocator) {
-          GST_ERROR_OBJECT(src, "Failed to create DMA-BUF allocator");
-          return;
-        }
-      }
-
       if (!src->accelerated_paint_active) {
         src->accelerated_paint_active = TRUE;
-        GST_INFO_OBJECT(src, "OnAcceleratedPaint active: Linux DMA-BUF zero-copy path enabled "
+        GST_INFO_OBJECT(src, "OnAcceleratedPaint active: Linux CUDA import path enabled "
                          "(planes=%d, modifier=0x%" G_GINT64_MODIFIER "x, format=%d)",
                          info.plane_count, info.modifier, info.format);
       }
 
-      // Create a GstBuffer and attach each dmabuf plane.
-      // We dup() each fd because CEF's texture pool may recycle the underlying
-      // buffer after this callback returns. The dup'd fd holds a kernel-level
-      // reference to the dmabuf, keeping the GPU memory alive until GStreamer
-      // unrefs the buffer and the allocator closes our fd.
-      GstBuffer *new_buffer = gst_buffer_new();
-      gsize offsets[4] = {0};
-      gint strides[4] = {0};
-
-      for (int i = 0; i < info.plane_count; i++) {
-        int duped_fd = dup(info.planes[i].fd);
-        if (duped_fd < 0) {
-          GST_ERROR_OBJECT(src, "Failed to dup() dmabuf fd for plane %d (fd=%d): %s",
-                           i, info.planes[i].fd, g_strerror(errno));
-          gst_buffer_unref(new_buffer);
+      // Lazily initialize CUDA context
+      if (!src->cuda_ctx) {
+        CUdevice dev;
+        CUresult res = cuInit(0);
+        if (res != CUDA_SUCCESS) {
+          GST_ERROR_OBJECT(src, "cuInit failed: %d", res);
           return;
         }
-
-        // gst_dmabuf_allocator_alloc takes ownership of duped_fd and will
-        // close it when the GstMemory is freed.
-        GstMemory *mem = gst_dmabuf_allocator_alloc(
-            src->dmabuf_allocator,
-            duped_fd,
-            info.planes[i].size);
-
-        if (!mem) {
-          GST_ERROR_OBJECT(src, "gst_dmabuf_allocator_alloc failed for plane %d", i);
-          close(duped_fd);
-          gst_buffer_unref(new_buffer);
+        res = cuDeviceGet(&dev, 0);
+        if (res != CUDA_SUCCESS) {
+          GST_ERROR_OBJECT(src, "cuDeviceGet failed: %d", res);
           return;
         }
-
-        // Set the memory offset within the dmabuf (for multi-plane formats
-        // where all planes share a single dmabuf fd)
-        mem->offset = info.planes[i].offset;
-
-        gst_buffer_append_memory(new_buffer, mem);
-
-        offsets[i] = info.planes[i].offset;
-        strides[i] = (gint)info.planes[i].stride;
+        res = cuCtxCreate(&src->cuda_ctx, 0, dev);
+        if (res != CUDA_SUCCESS) {
+          GST_ERROR_OBJECT(src, "cuCtxCreate failed: %d", res);
+          return;
+        }
+        GST_INFO_OBJECT(src, "CUDA context created for dmabuf import");
       }
 
-      // Add video metadata so downstream elements know the layout.
-      // CEF on Linux typically delivers BGRA (single plane).
-      GstVideoFormat gst_fmt = GST_VIDEO_FORMAT_BGRA;
-      // TODO: Map info.format (cef_color_type_t) to GstVideoFormat if CEF
-      // delivers other formats (e.g. RGBA, NV12). For now assume BGRA which
-      // matches the existing OnPaint output format.
+      cuCtxPushCurrent(src->cuda_ctx);
 
+      // Import the dmabuf fd into CUDA external memory.
+      // We must dup() the fd because cuImportExternalMemory takes ownership.
+      int duped_fd = dup(info.planes[0].fd);
+      if (duped_fd < 0) {
+        GST_ERROR_OBJECT(src, "Failed to dup() dmabuf fd: %s", g_strerror(errno));
+        cuCtxPopCurrent(NULL);
+        return;
+      }
+
+      gsize frame_size = info.planes[0].size;
+      gint stride = (gint)info.planes[0].stride;
+
+      CUDA_EXTERNAL_MEMORY_HANDLE_DESC memDesc = {};
+      memDesc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
+      memDesc.handle.fd = duped_fd;
+      memDesc.size = frame_size;
+      memDesc.flags = 0;
+
+      CUexternalMemory extMem = NULL;
+      CUresult res = cuImportExternalMemory(&extMem, &memDesc);
+      // Note: cuImportExternalMemory takes ownership of the fd (closes it on success)
+      if (res != CUDA_SUCCESS) {
+        GST_ERROR_OBJECT(src, "cuImportExternalMemory failed: %d (fd=%d, size=%zu)", res, duped_fd, frame_size);
+        close(duped_fd); // Only close on failure; CUDA closes on success
+        cuCtxPopCurrent(NULL);
+        return;
+      }
+
+      // Map the imported memory to get a device pointer
+      CUDA_EXTERNAL_MEMORY_BUFFER_DESC bufDesc = {};
+      bufDesc.offset = 0;
+      bufDesc.size = frame_size;
+      bufDesc.flags = 0;
+
+      CUdeviceptr srcPtr = 0;
+      res = cuExternalMemoryGetMappedBuffer(&srcPtr, extMem, &bufDesc);
+      if (res != CUDA_SUCCESS) {
+        GST_ERROR_OBJECT(src, "cuExternalMemoryGetMappedBuffer failed: %d", res);
+        cuDestroyExternalMemory(extMem);
+        cuCtxPopCurrent(NULL);
+        return;
+      }
+
+      // Allocate destination buffer (reuse if same size)
+      gsize dst_stride = width * 4; // BGRA = 4 bytes per pixel
+      gsize dst_size = dst_stride * height;
+
+      if (src->cuda_staging_size != dst_size) {
+        if (src->cuda_staging) {
+          cuMemFree(src->cuda_staging);
+        }
+        res = cuMemAlloc(&src->cuda_staging, dst_size);
+        if (res != CUDA_SUCCESS) {
+          GST_ERROR_OBJECT(src, "cuMemAlloc failed: %d (size=%zu)", res, dst_size);
+          cuDestroyExternalMemory(extMem);
+          cuCtxPopCurrent(NULL);
+          return;
+        }
+        src->cuda_staging_size = dst_size;
+        GST_INFO_OBJECT(src, "Allocated CUDA staging buffer: %zu bytes", dst_size);
+      }
+
+      // GPU->GPU copy from imported dmabuf to our staging buffer.
+      // Use 2D copy to handle potential stride differences.
+      // CUDA knows how to read NVIDIA's non-linear tiled formats correctly.
+      CUDA_MEMCPY2D copyParam = {};
+      copyParam.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+      copyParam.srcDevice = srcPtr;
+      copyParam.srcPitch = stride;
+      copyParam.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+      copyParam.dstDevice = src->cuda_staging;
+      copyParam.dstPitch = dst_stride;
+      copyParam.WidthInBytes = width * 4; // BGRA
+      copyParam.Height = height;
+
+      res = cuMemcpy2D(&copyParam);
+      if (res != CUDA_SUCCESS) {
+        GST_ERROR_OBJECT(src, "cuMemcpy2D failed: %d", res);
+        cuDestroyExternalMemory(extMem);
+        cuCtxPopCurrent(NULL);
+        return;
+      }
+
+      // Release the imported external memory (we've copied the pixels)
+      cuDestroyExternalMemory(extMem);
+
+      // Copy from CUDA staging to system memory for video/x-raw output.
+      // This is a stepping stone — future iteration can output GstCudaMemory
+      // directly with video/x-raw(memory:CUDAMemory) caps to eliminate this copy.
+      GstBuffer *new_buffer = gst_buffer_new_and_alloc(dst_size);
+      GstMapInfo map;
+      if (gst_buffer_map(new_buffer, &map, GST_MAP_WRITE)) {
+        res = cuMemcpyDtoH(map.data, src->cuda_staging, dst_size);
+        gst_buffer_unmap(new_buffer, &map);
+        if (res != CUDA_SUCCESS) {
+          GST_ERROR_OBJECT(src, "cuMemcpyDtoH failed: %d", res);
+          gst_buffer_unref(new_buffer);
+          cuCtxPopCurrent(NULL);
+          return;
+        }
+      } else {
+        GST_ERROR_OBJECT(src, "Failed to map output buffer");
+        gst_buffer_unref(new_buffer);
+        cuCtxPopCurrent(NULL);
+        return;
+      }
+
+      // Add video metadata
+      gsize offsets[1] = {0};
+      gint strides[1] = {(gint)dst_stride};
       gst_buffer_add_video_meta_full(new_buffer,
           GST_VIDEO_FRAME_FLAG_NONE,
-          gst_fmt,
+          GST_VIDEO_FORMAT_BGRA,
           width, height,
-          info.plane_count,
-          offsets,
-          strides);
+          1, offsets, strides);
+
+      cuCtxPopCurrent(NULL);
 
       GST_OBJECT_LOCK (src);
       gst_buffer_replace (&(src->current_buffer), new_buffer);
       gst_buffer_unref (new_buffer);
       GST_OBJECT_UNLOCK (src);
 
-      GST_LOG_OBJECT(src, "OnAcceleratedPaint dmabuf frame: %dx%d planes=%d modifier=0x%" G_GINT64_MODIFIER "x",
-                     width, height, info.plane_count, info.modifier);
+      GST_LOG_OBJECT(src, "OnAcceleratedPaint CUDA frame: %dx%d stride=%d", width, height, stride);
     }
 #endif
 
@@ -933,10 +1009,8 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
 
 #if defined(__linux__) && !defined(__ANDROID__)
   if (src->accelerated_paint_active) {
-    // For dmabuf-backed buffers, we must NOT deep-copy — gst_buffer_copy would
-    // mmap the dmabuf and memcpy pixels to system memory, defeating zero-copy.
-    // Instead, take a ref to share the underlying dmabuf fd with downstream.
-    // The dup'd fd keeps the GPU memory alive until downstream unrefs.
+    // OnAcceleratedPaint creates a new buffer each frame (CUDA import path),
+    // so ref is safe (no reuse). Avoids an unnecessary memcpy vs gst_buffer_copy.
     *buf = gst_buffer_ref (src->current_buffer);
   } else
 #endif
@@ -1590,6 +1664,16 @@ gst_cef_src_finalize (GObject *object)
     gst_object_unref (src->dmabuf_allocator);
     src->dmabuf_allocator = NULL;
   }
+  if (src->cuda_staging) {
+    cuCtxPushCurrent(src->cuda_ctx);
+    cuMemFree(src->cuda_staging);
+    cuCtxPopCurrent(NULL);
+    src->cuda_staging = 0;
+  }
+  if (src->cuda_ctx) {
+    cuCtxDestroy(src->cuda_ctx);
+    src->cuda_ctx = NULL;
+  }
 #endif
 
   if (src->audio_buffers) {
@@ -1623,6 +1707,9 @@ gst_cef_src_init (GstCefSrc * src)
 #if defined(__linux__) && !defined(__ANDROID__)
   src->dmabuf_allocator = NULL;
   src->accelerated_paint_active = FALSE;
+  src->cuda_ctx = NULL;
+  src->cuda_staging = 0;
+  src->cuda_staging_size = 0;
 #endif
   src->chromium_debug_port = DEFAULT_CHROMIUM_DEBUG_PORT;
 

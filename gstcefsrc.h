@@ -18,6 +18,7 @@ class D3D11TextureReader;
 
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <gst/allocators/gstdmabuf.h>
+#include <cuda.h>
 #endif
 
 G_BEGIN_DECLS
@@ -81,6 +82,9 @@ struct _GstCefSrc {
 #if defined(__linux__) && !defined(__ANDROID__)
   GstAllocator *dmabuf_allocator;
   gboolean accelerated_paint_active;
+  CUcontext cuda_ctx;
+  CUdeviceptr cuda_staging;
+  gsize cuda_staging_size;
 #endif
 };
 
