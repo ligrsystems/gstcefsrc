@@ -432,14 +432,14 @@ class RenderHandler : public CefRenderHandler
         EGL_NONE
       };
 
-      EGLImageKHR egl_image = eglCreateImageKHR(
+      EGLImage egl_image = eglCreateImage(
           src->egl_display, EGL_NO_CONTEXT,
           EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);
 
       close(duped_fd); // EGL takes a reference; we can close our dup
 
-      if (egl_image == EGL_NO_IMAGE_KHR) {
-        GST_ERROR_OBJECT(src, "eglCreateImageKHR failed: 0x%x", eglGetError());
+      if (egl_image == EGL_NO_IMAGE) {
+        GST_ERROR_OBJECT(src, "eglCreateImage failed: 0x%x", eglGetError());
         cuCtxPopCurrent(NULL);
         return;
       }
@@ -450,7 +450,7 @@ class RenderHandler : public CefRenderHandler
                                                  CU_GRAPHICS_MAP_RESOURCE_FLAGS_READ_ONLY);
       if (res != CUDA_SUCCESS) {
         GST_ERROR_OBJECT(src, "cuGraphicsEGLRegisterImage failed: %d", res);
-        eglDestroyImageKHR(src->egl_display, egl_image);
+        eglDestroyImage(src->egl_display, egl_image);
         cuCtxPopCurrent(NULL);
         return;
       }
@@ -461,7 +461,7 @@ class RenderHandler : public CefRenderHandler
       if (res != CUDA_SUCCESS) {
         GST_ERROR_OBJECT(src, "cuGraphicsResourceGetMappedEglFrame failed: %d", res);
         cuGraphicsUnregisterResource(cuda_resource);
-        eglDestroyImageKHR(src->egl_display, egl_image);
+        eglDestroyImage(src->egl_display, egl_image);
         cuCtxPopCurrent(NULL);
         return;
       }
@@ -489,7 +489,7 @@ class RenderHandler : public CefRenderHandler
           GST_ERROR_OBJECT(src, "cuMemcpy2D failed: %d", res);
           gst_buffer_unref(new_buffer);
           cuGraphicsUnregisterResource(cuda_resource);
-          eglDestroyImageKHR(src->egl_display, egl_image);
+          eglDestroyImage(src->egl_display, egl_image);
           cuCtxPopCurrent(NULL);
           return;
         }
@@ -497,14 +497,14 @@ class RenderHandler : public CefRenderHandler
         GST_ERROR_OBJECT(src, "Failed to map output buffer");
         gst_buffer_unref(new_buffer);
         cuGraphicsUnregisterResource(cuda_resource);
-        eglDestroyImageKHR(src->egl_display, egl_image);
+        eglDestroyImage(src->egl_display, egl_image);
         cuCtxPopCurrent(NULL);
         return;
       }
 
       // Cleanup per-frame EGL/CUDA resources
       cuGraphicsUnregisterResource(cuda_resource);
-      eglDestroyImageKHR(src->egl_display, egl_image);
+      eglDestroyImage(src->egl_display, egl_image);
 
       // Add video metadata
       gsize offsets[1] = {0};
