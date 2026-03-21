@@ -420,15 +420,16 @@ class RenderHandler : public CefRenderHandler
       gint stride = (gint)info.planes[0].stride;
 
       // Import dmabuf fd into EGL image using EGL_LINUX_DMA_BUF_EXT
-      EGLint img_attrs[] = {
+      // EGL 1.5 eglCreateImage requires EGLAttrib (intptr_t), not EGLint (int32_t)
+      EGLAttrib img_attrs[] = {
         EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,
         EGL_WIDTH, width,
         EGL_HEIGHT, height,
         EGL_DMA_BUF_PLANE0_FD_EXT, duped_fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)info.planes[0].offset,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLAttrib)info.planes[0].offset,
         EGL_DMA_BUF_PLANE0_PITCH_EXT, stride,
-        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(info.modifier & 0xFFFFFFFF),
-        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(info.modifier >> 32),
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLAttrib)(info.modifier & 0xFFFFFFFF),
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLAttrib)(info.modifier >> 32),
         EGL_NONE
       };
 
