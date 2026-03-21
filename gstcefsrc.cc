@@ -32,6 +32,10 @@
 #include <errno.h>
 #include <gst/allocators/gstdmabuf.h>
 #include <cuda.h>
+#include <cudaEGL.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <drm_fourcc.h>
 #endif
 
 #define GST_ELEMENT_PROGRESS(el, type, code, text)      \
@@ -377,31 +381,35 @@ class RenderHandler : public CefRenderHandler
                          info.plane_count, info.modifier, info.format);
       }
 
-      // Lazily initialize CUDA context
+      // Lazily initialize EGL + CUDA context for dmabuf import
+      if (!src->egl_display) {
+        src->egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        if (src->egl_display == EGL_NO_DISPLAY) {
+          GST_ERROR_OBJECT(src, "eglGetDisplay failed");
+          return;
+        }
+        EGLint major, minor;
+        if (!eglInitialize(src->egl_display, &major, &minor)) {
+          GST_ERROR_OBJECT(src, "eglInitialize failed: 0x%x", eglGetError());
+          src->egl_display = EGL_NO_DISPLAY;
+          return;
+        }
+        GST_INFO_OBJECT(src, "EGL initialized: %d.%d", major, minor);
+      }
+
       if (!src->cuda_ctx) {
         CUdevice dev;
         CUresult res = cuInit(0);
-        if (res != CUDA_SUCCESS) {
-          GST_ERROR_OBJECT(src, "cuInit failed: %d", res);
-          return;
-        }
+        if (res != CUDA_SUCCESS) { GST_ERROR_OBJECT(src, "cuInit failed: %d", res); return; }
         res = cuDeviceGet(&dev, 0);
-        if (res != CUDA_SUCCESS) {
-          GST_ERROR_OBJECT(src, "cuDeviceGet failed: %d", res);
-          return;
-        }
+        if (res != CUDA_SUCCESS) { GST_ERROR_OBJECT(src, "cuDeviceGet failed: %d", res); return; }
         res = cuCtxCreate(&src->cuda_ctx, 0, dev);
-        if (res != CUDA_SUCCESS) {
-          GST_ERROR_OBJECT(src, "cuCtxCreate failed: %d", res);
-          return;
-        }
-        GST_INFO_OBJECT(src, "CUDA context created for dmabuf import");
+        if (res != CUDA_SUCCESS) { GST_ERROR_OBJECT(src, "cuCtxCreate failed: %d", res); return; }
+        GST_INFO_OBJECT(src, "CUDA context created for EGL dmabuf import");
       }
 
       cuCtxPushCurrent(src->cuda_ctx);
 
-      // Import the dmabuf fd into CUDA external memory.
-      // We must dup() the fd because cuImportExternalMemory takes ownership.
       int duped_fd = dup(info.planes[0].fd);
       if (duped_fd < 0) {
         GST_ERROR_OBJECT(src, "Failed to dup() dmabuf fd: %s", g_strerror(errno));
@@ -409,103 +417,94 @@ class RenderHandler : public CefRenderHandler
         return;
       }
 
-      gsize frame_size = info.planes[0].size;
       gint stride = (gint)info.planes[0].stride;
 
-      CUDA_EXTERNAL_MEMORY_HANDLE_DESC memDesc = {};
-      memDesc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
-      memDesc.handle.fd = duped_fd;
-      memDesc.size = frame_size;
-      memDesc.flags = 0;
+      // Import dmabuf fd into EGL image using EGL_LINUX_DMA_BUF_EXT
+      EGLint img_attrs[] = {
+        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,
+        EGL_WIDTH, width,
+        EGL_HEIGHT, height,
+        EGL_DMA_BUF_PLANE0_FD_EXT, duped_fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)info.planes[0].offset,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, stride,
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(info.modifier & 0xFFFFFFFF),
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(info.modifier >> 32),
+        EGL_NONE
+      };
 
-      CUexternalMemory extMem = NULL;
-      CUresult res = cuImportExternalMemory(&extMem, &memDesc);
-      // Note: cuImportExternalMemory takes ownership of the fd (closes it on success)
-      if (res != CUDA_SUCCESS) {
-        GST_ERROR_OBJECT(src, "cuImportExternalMemory failed: %d (fd=%d, size=%zu)", res, duped_fd, frame_size);
-        close(duped_fd); // Only close on failure; CUDA closes on success
+      EGLImageKHR egl_image = eglCreateImageKHR(
+          src->egl_display, EGL_NO_CONTEXT,
+          EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);
+
+      close(duped_fd); // EGL takes a reference; we can close our dup
+
+      if (egl_image == EGL_NO_IMAGE_KHR) {
+        GST_ERROR_OBJECT(src, "eglCreateImageKHR failed: 0x%x", eglGetError());
         cuCtxPopCurrent(NULL);
         return;
       }
 
-      // Map the imported memory to get a device pointer
-      CUDA_EXTERNAL_MEMORY_BUFFER_DESC bufDesc = {};
-      bufDesc.offset = 0;
-      bufDesc.size = frame_size;
-      bufDesc.flags = 0;
-
-      CUdeviceptr srcPtr = 0;
-      res = cuExternalMemoryGetMappedBuffer(&srcPtr, extMem, &bufDesc);
+      // Register EGL image with CUDA to get a device pointer
+      CUgraphicsResource cuda_resource = NULL;
+      CUresult res = cuGraphicsEGLRegisterImage(&cuda_resource, egl_image,
+                                                 CU_GRAPHICS_MAP_RESOURCE_FLAGS_READ_ONLY);
       if (res != CUDA_SUCCESS) {
-        GST_ERROR_OBJECT(src, "cuExternalMemoryGetMappedBuffer failed: %d", res);
-        cuDestroyExternalMemory(extMem);
+        GST_ERROR_OBJECT(src, "cuGraphicsEGLRegisterImage failed: %d", res);
+        eglDestroyImageKHR(src->egl_display, egl_image);
         cuCtxPopCurrent(NULL);
         return;
       }
 
-      // Allocate destination buffer (reuse if same size)
-      gsize dst_stride = width * 4; // BGRA = 4 bytes per pixel
+      // Map the resource to get a CUeglFrame with the device pointer
+      CUeglFrame egl_frame;
+      res = cuGraphicsResourceGetMappedEglFrame(&egl_frame, cuda_resource, 0, 0);
+      if (res != CUDA_SUCCESS) {
+        GST_ERROR_OBJECT(src, "cuGraphicsResourceGetMappedEglFrame failed: %d", res);
+        cuGraphicsUnregisterResource(cuda_resource);
+        eglDestroyImageKHR(src->egl_display, egl_image);
+        cuCtxPopCurrent(NULL);
+        return;
+      }
+
+      // Copy from CUDA device memory to system memory buffer
+      gsize dst_stride = width * 4; // BGRA
       gsize dst_size = dst_stride * height;
 
-      if (src->cuda_staging_size != dst_size) {
-        if (src->cuda_staging) {
-          cuMemFree(src->cuda_staging);
-        }
-        res = cuMemAlloc(&src->cuda_staging, dst_size);
-        if (res != CUDA_SUCCESS) {
-          GST_ERROR_OBJECT(src, "cuMemAlloc failed: %d (size=%zu)", res, dst_size);
-          cuDestroyExternalMemory(extMem);
-          cuCtxPopCurrent(NULL);
-          return;
-        }
-        src->cuda_staging_size = dst_size;
-        GST_INFO_OBJECT(src, "Allocated CUDA staging buffer: %zu bytes", dst_size);
-      }
-
-      // GPU->GPU copy from imported dmabuf to our staging buffer.
-      // Use 2D copy to handle potential stride differences.
-      // CUDA knows how to read NVIDIA's non-linear tiled formats correctly.
-      CUDA_MEMCPY2D copyParam = {};
-      copyParam.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-      copyParam.srcDevice = srcPtr;
-      copyParam.srcPitch = stride;
-      copyParam.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-      copyParam.dstDevice = src->cuda_staging;
-      copyParam.dstPitch = dst_stride;
-      copyParam.WidthInBytes = width * 4; // BGRA
-      copyParam.Height = height;
-
-      res = cuMemcpy2D(&copyParam);
-      if (res != CUDA_SUCCESS) {
-        GST_ERROR_OBJECT(src, "cuMemcpy2D failed: %d", res);
-        cuDestroyExternalMemory(extMem);
-        cuCtxPopCurrent(NULL);
-        return;
-      }
-
-      // Release the imported external memory (we've copied the pixels)
-      cuDestroyExternalMemory(extMem);
-
-      // Copy from CUDA staging to system memory for video/x-raw output.
-      // This is a stepping stone — future iteration can output GstCudaMemory
-      // directly with video/x-raw(memory:CUDAMemory) caps to eliminate this copy.
       GstBuffer *new_buffer = gst_buffer_new_and_alloc(dst_size);
       GstMapInfo map;
       if (gst_buffer_map(new_buffer, &map, GST_MAP_WRITE)) {
-        res = cuMemcpyDtoH(map.data, src->cuda_staging, dst_size);
+        CUDA_MEMCPY2D copyParam = {};
+        copyParam.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        copyParam.srcDevice = (CUdeviceptr)egl_frame.frame.pPitch[0];
+        copyParam.srcPitch = egl_frame.pitch;
+        copyParam.dstMemoryType = CU_MEMORYTYPE_HOST;
+        copyParam.dstHost = map.data;
+        copyParam.dstPitch = dst_stride;
+        copyParam.WidthInBytes = width * 4;
+        copyParam.Height = height;
+
+        res = cuMemcpy2D(&copyParam);
         gst_buffer_unmap(new_buffer, &map);
         if (res != CUDA_SUCCESS) {
-          GST_ERROR_OBJECT(src, "cuMemcpyDtoH failed: %d", res);
+          GST_ERROR_OBJECT(src, "cuMemcpy2D failed: %d", res);
           gst_buffer_unref(new_buffer);
+          cuGraphicsUnregisterResource(cuda_resource);
+          eglDestroyImageKHR(src->egl_display, egl_image);
           cuCtxPopCurrent(NULL);
           return;
         }
       } else {
         GST_ERROR_OBJECT(src, "Failed to map output buffer");
         gst_buffer_unref(new_buffer);
+        cuGraphicsUnregisterResource(cuda_resource);
+        eglDestroyImageKHR(src->egl_display, egl_image);
         cuCtxPopCurrent(NULL);
         return;
       }
+
+      // Cleanup per-frame EGL/CUDA resources
+      cuGraphicsUnregisterResource(cuda_resource);
+      eglDestroyImageKHR(src->egl_display, egl_image);
 
       // Add video metadata
       gsize offsets[1] = {0};
@@ -523,7 +522,7 @@ class RenderHandler : public CefRenderHandler
       gst_buffer_unref (new_buffer);
       GST_OBJECT_UNLOCK (src);
 
-      GST_LOG_OBJECT(src, "OnAcceleratedPaint CUDA frame: %dx%d stride=%d", width, height, stride);
+      GST_LOG_OBJECT(src, "OnAcceleratedPaint EGL+CUDA frame: %dx%d stride=%d", width, height, stride);
     }
 #endif
 
@@ -1664,11 +1663,9 @@ gst_cef_src_finalize (GObject *object)
     gst_object_unref (src->dmabuf_allocator);
     src->dmabuf_allocator = NULL;
   }
-  if (src->cuda_staging) {
-    cuCtxPushCurrent(src->cuda_ctx);
-    cuMemFree(src->cuda_staging);
-    cuCtxPopCurrent(NULL);
-    src->cuda_staging = 0;
+  if (src->egl_display != EGL_NO_DISPLAY) {
+    eglTerminate(src->egl_display);
+    src->egl_display = EGL_NO_DISPLAY;
   }
   if (src->cuda_ctx) {
     cuCtxDestroy(src->cuda_ctx);
@@ -1708,8 +1705,7 @@ gst_cef_src_init (GstCefSrc * src)
   src->dmabuf_allocator = NULL;
   src->accelerated_paint_active = FALSE;
   src->cuda_ctx = NULL;
-  src->cuda_staging = 0;
-  src->cuda_staging_size = 0;
+  src->egl_display = EGL_NO_DISPLAY;
 #endif
   src->chromium_debug_port = DEFAULT_CHROMIUM_DEBUG_PORT;
 
