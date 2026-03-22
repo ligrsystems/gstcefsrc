@@ -467,7 +467,17 @@ class RenderHandler : public CefRenderHandler
         return;
       }
 
-      // Copy from CUDA device memory to system memory buffer
+      // Log frame type on first frame for debugging
+      if (!src->egl_frame_type_logged) {
+        src->egl_frame_type_logged = TRUE;
+        GST_INFO_OBJECT(src, "EGL frame type: %s, cuFormat=%d, eglColorFormat=%d, planeCount=%d, pitch=%u",
+                         egl_frame.frameType == CU_EGL_FRAME_TYPE_ARRAY ? "ARRAY (tiled)" : "PITCH (linear)",
+                         egl_frame.cuFormat, egl_frame.eglColorFormat,
+                         egl_frame.planeCount, egl_frame.pitch);
+      }
+
+      // Copy from CUDA memory to system memory buffer
+      // NVIDIA tiled dmabufs produce CU_EGL_FRAME_TYPE_ARRAY; linear ones produce PITCH
       gsize dst_stride = width * 4; // BGRA
       gsize dst_size = dst_stride * height;
 
@@ -475,19 +485,28 @@ class RenderHandler : public CefRenderHandler
       GstMapInfo map;
       if (gst_buffer_map(new_buffer, &map, GST_MAP_WRITE)) {
         CUDA_MEMCPY2D copyParam = {};
-        copyParam.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-        copyParam.srcDevice = (CUdeviceptr)egl_frame.frame.pPitch[0];
-        copyParam.srcPitch = egl_frame.pitch;
         copyParam.dstMemoryType = CU_MEMORYTYPE_HOST;
         copyParam.dstHost = map.data;
         copyParam.dstPitch = dst_stride;
         copyParam.WidthInBytes = width * 4;
         copyParam.Height = height;
 
+        if (egl_frame.frameType == CU_EGL_FRAME_TYPE_ARRAY) {
+          // Tiled NVIDIA memory — use CUDA array copy which handles de-tiling
+          copyParam.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+          copyParam.srcArray = egl_frame.frame.pArray[0];
+        } else {
+          // Linear pitched memory
+          copyParam.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+          copyParam.srcDevice = (CUdeviceptr)egl_frame.frame.pPitch[0];
+          copyParam.srcPitch = egl_frame.pitch;
+        }
+
         res = cuMemcpy2D(&copyParam);
         gst_buffer_unmap(new_buffer, &map);
         if (res != CUDA_SUCCESS) {
-          GST_ERROR_OBJECT(src, "cuMemcpy2D failed: %d", res);
+          GST_ERROR_OBJECT(src, "cuMemcpy2D failed: %d (frameType=%s)", res,
+                           egl_frame.frameType == CU_EGL_FRAME_TYPE_ARRAY ? "ARRAY" : "PITCH");
           gst_buffer_unref(new_buffer);
           cuGraphicsUnregisterResource(cuda_resource);
           eglDestroyImage(src->egl_display, egl_image);

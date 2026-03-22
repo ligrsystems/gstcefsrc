@@ -86,6 +86,7 @@ struct _GstCefSrc {
 #if defined(__linux__) && !defined(__ANDROID__)
   GstAllocator *dmabuf_allocator;
   gboolean accelerated_paint_active;
+  gboolean egl_frame_type_logged;
   CUcontext cuda_ctx;
   EGLDisplay egl_display;
 #endif
