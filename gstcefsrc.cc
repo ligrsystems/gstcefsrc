@@ -542,6 +542,27 @@ class RenderHandler : public CefRenderHandler
       gst_buffer_unref (new_buffer);
       GST_OBJECT_UNLOCK (src);
 
+      // Dump first pixel of first few frames for diagnostics
+      if (src->accel_frame_count < 3) {
+        GstMapInfo dbg_map;
+        if (gst_buffer_map(new_buffer, &dbg_map, GST_MAP_READ)) {
+          if (dbg_map.size >= 16) {
+            GST_INFO_OBJECT(src, "OnAcceleratedPaint frame %d pixel dump: "
+                            "[0]=%02x [1]=%02x [2]=%02x [3]=%02x  "
+                            "[4]=%02x [5]=%02x [6]=%02x [7]=%02x  "
+                            "[8]=%02x [9]=%02x [10]=%02x [11]=%02x  "
+                            "[12]=%02x [13]=%02x [14]=%02x [15]=%02x",
+                            src->accel_frame_count,
+                            dbg_map.data[0], dbg_map.data[1], dbg_map.data[2], dbg_map.data[3],
+                            dbg_map.data[4], dbg_map.data[5], dbg_map.data[6], dbg_map.data[7],
+                            dbg_map.data[8], dbg_map.data[9], dbg_map.data[10], dbg_map.data[11],
+                            dbg_map.data[12], dbg_map.data[13], dbg_map.data[14], dbg_map.data[15]);
+          }
+          gst_buffer_unmap(new_buffer, &dbg_map);
+        }
+        src->accel_frame_count++;
+      }
+
       GST_LOG_OBJECT(src, "OnAcceleratedPaint EGL+CUDA frame: %dx%d stride=%d", width, height, stride);
     }
 #endif

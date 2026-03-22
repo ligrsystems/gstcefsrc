@@ -87,6 +87,7 @@ struct _GstCefSrc {
   GstAllocator *dmabuf_allocator;
   gboolean accelerated_paint_active;
   gboolean egl_frame_type_logged;
+  gint accel_frame_count;
   CUcontext cuda_ctx;
   EGLDisplay egl_display;
 #endif
