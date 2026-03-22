@@ -537,12 +537,7 @@ class RenderHandler : public CefRenderHandler
 
       cuCtxPopCurrent(NULL);
 
-      GST_OBJECT_LOCK (src);
-      gst_buffer_replace (&(src->current_buffer), new_buffer);
-      gst_buffer_unref (new_buffer);
-      GST_OBJECT_UNLOCK (src);
-
-      // Dump first pixel of first few frames for diagnostics
+      // Dump first pixel of first few frames for diagnostics (before handing off buffer)
       if (src->accel_frame_count < 3) {
         GstMapInfo dbg_map;
         if (gst_buffer_map(new_buffer, &dbg_map, GST_MAP_READ)) {
@@ -562,6 +557,11 @@ class RenderHandler : public CefRenderHandler
         }
         src->accel_frame_count++;
       }
+
+      GST_OBJECT_LOCK (src);
+      gst_buffer_replace (&(src->current_buffer), new_buffer);
+      gst_buffer_unref (new_buffer);
+      GST_OBJECT_UNLOCK (src);
 
       GST_LOG_OBJECT(src, "OnAcceleratedPaint EGL+CUDA frame: %dx%d stride=%d", width, height, stride);
     }
