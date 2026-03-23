@@ -449,7 +449,7 @@ class RenderHandler : public CefRenderHandler
         if (res != CUDA_SUCCESS) { GST_ERROR_OBJECT(src, "cuInit failed: %d", res); return; }
         res = cuDeviceGet(&dev, 0);
         if (res != CUDA_SUCCESS) { GST_ERROR_OBJECT(src, "cuDeviceGet failed: %d", res); return; }
-        res = cuCtxCreate(&src->cuda_ctx, 0, dev);
+        res = cuCtxCreate_v2(&src->cuda_ctx, 0, dev);
         if (res != CUDA_SUCCESS) { GST_ERROR_OBJECT(src, "cuCtxCreate failed: %d", res); return; }
         GST_INFO_OBJECT(src, "CUDA context created for GL interop");
       }
