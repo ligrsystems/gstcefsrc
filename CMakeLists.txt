@@ -128,11 +128,13 @@ if(OS_WINDOWS)
   target_link_libraries("gstcef" d3d11.lib dxgi.lib ole32.lib)
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  # EGL + CUDA interop for importing dmabuf fds via eglCreateImageKHR + cuGraphicsEGLRegisterImage
+  # GL + CUDA interop for zero-copy dmabuf import:
+  # dmabuf → EGLImage → GL texture → cuGraphicsGLRegisterImage → CUarray → host
   find_package(CUDAToolkit REQUIRED)
+  find_package(OpenGL REQUIRED)
   pkg_check_modules(EGL REQUIRED egl)
   pkg_check_modules(DRM REQUIRED libdrm)
-  target_link_libraries("gstcef" CUDA::cuda_driver ${EGL_LIBRARIES})
+  target_link_libraries("gstcef" CUDA::cuda_driver OpenGL::GL ${EGL_LIBRARIES})
   target_include_directories("gstcef" PUBLIC ${EGL_INCLUDE_DIRS} ${DRM_INCLUDE_DIRS})
 endif()
 target_include_directories("gstcef" PUBLIC ${GST_INCLUDE_DIRS})

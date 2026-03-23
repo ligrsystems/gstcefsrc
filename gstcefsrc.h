@@ -18,11 +18,15 @@ class D3D11TextureReader;
 
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <gst/allocators/gstdmabuf.h>
-#include <cuda.h>
-#include <cudaEGL.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <GL/gl.h>
+#include <cuda.h>
+#include <cudaGL.h>
 #include <drm_fourcc.h>
+
+// Extension function type for importing EGL images into GL textures
+typedef void (*PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)(GLenum target, void* image);
 #endif
 
 G_BEGIN_DECLS
@@ -86,10 +90,12 @@ struct _GstCefSrc {
 #if defined(__linux__) && !defined(__ANDROID__)
   GstAllocator *dmabuf_allocator;
   gboolean accelerated_paint_active;
-  gboolean egl_frame_type_logged;
   gint accel_frame_count;
   CUcontext cuda_ctx;
   EGLDisplay egl_display;
+  EGLContext egl_context;
+  GLuint gl_texture;
+  PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
 #endif
 };
 

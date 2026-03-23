@@ -31,10 +31,11 @@
 #include <unistd.h>
 #include <errno.h>
 #include <gst/allocators/gstdmabuf.h>
-#include <cuda.h>
-#include <cudaEGL.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <GL/gl.h>
+#include <cuda.h>
+#include <cudaGL.h>
 #include <drm_fourcc.h>
 #endif
 
@@ -376,13 +377,14 @@ class RenderHandler : public CefRenderHandler
 
       if (!src->accelerated_paint_active) {
         src->accelerated_paint_active = TRUE;
-        GST_INFO_OBJECT(src, "OnAcceleratedPaint active: Linux CUDA import path enabled "
+        GST_INFO_OBJECT(src, "OnAcceleratedPaint active: Linux GL interop path enabled "
                          "(planes=%d, modifier=0x%" G_GINT64_MODIFIER "x, format=%d)",
                          info.plane_count, info.modifier, info.format);
       }
 
-      // Lazily initialize EGL + CUDA context for dmabuf import
-      if (!src->egl_display) {
+      // --- One-time initialization: EGL display + GL context + CUDA context ---
+
+      if (src->egl_display == EGL_NO_DISPLAY) {
         src->egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
         if (src->egl_display == EGL_NO_DISPLAY) {
           GST_ERROR_OBJECT(src, "eglGetDisplay failed");
@@ -397,6 +399,50 @@ class RenderHandler : public CefRenderHandler
         GST_INFO_OBJECT(src, "EGL initialized: %d.%d", major, minor);
       }
 
+      // Create EGL context with full OpenGL API (required for cuGraphicsGLRegisterImage)
+      if (src->egl_context == EGL_NO_CONTEXT) {
+        if (!eglBindAPI(EGL_OPENGL_API)) {
+          GST_ERROR_OBJECT(src, "eglBindAPI(EGL_OPENGL_API) failed: 0x%x", eglGetError());
+          return;
+        }
+        EGLint config_attribs[] = {
+          EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+          EGL_NONE
+        };
+        EGLConfig config;
+        EGLint num_configs;
+        if (!eglChooseConfig(src->egl_display, config_attribs, &config, 1, &num_configs)
+            || num_configs == 0) {
+          GST_ERROR_OBJECT(src, "eglChooseConfig failed: 0x%x (num=%d)", eglGetError(), num_configs);
+          return;
+        }
+        EGLint ctx_attribs[] = { EGL_NONE };
+        src->egl_context = eglCreateContext(src->egl_display, config,
+                                            EGL_NO_CONTEXT, ctx_attribs);
+        if (src->egl_context == EGL_NO_CONTEXT) {
+          GST_ERROR_OBJECT(src, "eglCreateContext failed: 0x%x", eglGetError());
+          return;
+        }
+        // Surfaceless make-current (EGL_KHR_surfaceless_context)
+        if (!eglMakeCurrent(src->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                            src->egl_context)) {
+          GST_ERROR_OBJECT(src, "eglMakeCurrent surfaceless failed: 0x%x", eglGetError());
+          eglDestroyContext(src->egl_display, src->egl_context);
+          src->egl_context = EGL_NO_CONTEXT;
+          return;
+        }
+        // Load GL extension for EGL image → GL texture binding
+        src->glEGLImageTargetTexture2DOES =
+            (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+        if (!src->glEGLImageTargetTexture2DOES) {
+          GST_ERROR_OBJECT(src, "glEGLImageTargetTexture2DOES not available");
+          return;
+        }
+        glGenTextures(1, &src->gl_texture);
+        GST_INFO_OBJECT(src, "EGL/GL context created (texture=%u)", src->gl_texture);
+      }
+
+      // CUDA context (must be created after GL context for shared device)
       if (!src->cuda_ctx) {
         CUdevice dev;
         CUresult res = cuInit(0);
@@ -405,9 +451,12 @@ class RenderHandler : public CefRenderHandler
         if (res != CUDA_SUCCESS) { GST_ERROR_OBJECT(src, "cuDeviceGet failed: %d", res); return; }
         res = cuCtxCreate(&src->cuda_ctx, 0, dev);
         if (res != CUDA_SUCCESS) { GST_ERROR_OBJECT(src, "cuCtxCreate failed: %d", res); return; }
-        GST_INFO_OBJECT(src, "CUDA context created for EGL dmabuf import");
+        GST_INFO_OBJECT(src, "CUDA context created for GL interop");
       }
 
+      // --- Per-frame: dmabuf → EGLImage → GL texture → CUDA array → host ---
+
+      eglMakeCurrent(src->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, src->egl_context);
       cuCtxPushCurrent(src->cuda_ctx);
 
       int duped_fd = dup(info.planes[0].fd);
@@ -419,8 +468,7 @@ class RenderHandler : public CefRenderHandler
 
       gint stride = (gint)info.planes[0].stride;
 
-      // Import dmabuf fd into EGL image using EGL_LINUX_DMA_BUF_EXT
-      // EGL 1.5 eglCreateImage requires EGLAttrib (intptr_t), not EGLint (int32_t)
+      // Import dmabuf fd into EGL image
       EGLAttrib img_attrs[] = {
         EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,
         EGL_WIDTH, width,
@@ -437,7 +485,7 @@ class RenderHandler : public CefRenderHandler
           src->egl_display, EGL_NO_CONTEXT,
           EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);
 
-      close(duped_fd); // EGL takes a reference; we can close our dup
+      close(duped_fd);
 
       if (egl_image == EGL_NO_IMAGE) {
         GST_ERROR_OBJECT(src, "eglCreateImage failed: 0x%x", eglGetError());
@@ -445,39 +493,52 @@ class RenderHandler : public CefRenderHandler
         return;
       }
 
-      // Register EGL image with CUDA to get a device pointer
-      CUgraphicsResource cuda_resource = NULL;
-      CUresult res = cuGraphicsEGLRegisterImage(&cuda_resource, egl_image,
-                                                 CU_GRAPHICS_MAP_RESOURCE_FLAGS_READ_ONLY);
-      if (res != CUDA_SUCCESS) {
-        GST_ERROR_OBJECT(src, "cuGraphicsEGLRegisterImage failed: %d", res);
+      // Bind EGL image to GL texture — NVIDIA driver handles tiled→linear detiling
+      glBindTexture(GL_TEXTURE_2D, src->gl_texture);
+      src->glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (void*)egl_image);
+
+      GLenum gl_err = glGetError();
+      if (gl_err != GL_NO_ERROR) {
+        GST_ERROR_OBJECT(src, "GL error after EGLImageTargetTexture2DOES: 0x%x", gl_err);
         eglDestroyImage(src->egl_display, egl_image);
         cuCtxPopCurrent(NULL);
         return;
       }
 
-      // Map the resource to get a CUeglFrame with the device pointer
-      CUeglFrame egl_frame;
-      res = cuGraphicsResourceGetMappedEglFrame(&egl_frame, cuda_resource, 0, 0);
+      // Register GL texture with CUDA (desktop GPU interop — NOT cuGraphicsEGLRegisterImage
+      // which is Tegra-only and returns all-zeros on desktop GPUs)
+      CUgraphicsResource cuda_resource = NULL;
+      CUresult res = cuGraphicsGLRegisterImage(&cuda_resource, src->gl_texture,
+                                                GL_TEXTURE_2D,
+                                                CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY);
       if (res != CUDA_SUCCESS) {
-        GST_ERROR_OBJECT(src, "cuGraphicsResourceGetMappedEglFrame failed: %d", res);
+        GST_ERROR_OBJECT(src, "cuGraphicsGLRegisterImage failed: %d", res);
+        eglDestroyImage(src->egl_display, egl_image);
+        cuCtxPopCurrent(NULL);
+        return;
+      }
+
+      res = cuGraphicsMapResources(1, &cuda_resource, 0);
+      if (res != CUDA_SUCCESS) {
+        GST_ERROR_OBJECT(src, "cuGraphicsMapResources failed: %d", res);
         cuGraphicsUnregisterResource(cuda_resource);
         eglDestroyImage(src->egl_display, egl_image);
         cuCtxPopCurrent(NULL);
         return;
       }
 
-      // Log frame type on first frame for debugging
-      if (!src->egl_frame_type_logged) {
-        src->egl_frame_type_logged = TRUE;
-        GST_INFO_OBJECT(src, "EGL frame type: %s, cuFormat=%d, eglColorFormat=%d, planeCount=%d, pitch=%u",
-                         egl_frame.frameType == CU_EGL_FRAME_TYPE_ARRAY ? "ARRAY (tiled)" : "PITCH (linear)",
-                         egl_frame.cuFormat, egl_frame.eglColorFormat,
-                         egl_frame.planeCount, egl_frame.pitch);
+      CUarray cuda_array;
+      res = cuGraphicsSubResourceGetMappedArray(&cuda_array, cuda_resource, 0, 0);
+      if (res != CUDA_SUCCESS) {
+        GST_ERROR_OBJECT(src, "cuGraphicsSubResourceGetMappedArray failed: %d", res);
+        cuGraphicsUnmapResources(1, &cuda_resource, 0);
+        cuGraphicsUnregisterResource(cuda_resource);
+        eglDestroyImage(src->egl_display, egl_image);
+        cuCtxPopCurrent(NULL);
+        return;
       }
 
-      // Copy from CUDA memory to system memory buffer
-      // NVIDIA tiled dmabufs produce CU_EGL_FRAME_TYPE_ARRAY; linear ones produce PITCH
+      // Copy from CUDA array (GPU) to host memory
       gsize dst_stride = width * 4; // BGRA
       gsize dst_size = dst_stride * height;
 
@@ -485,29 +546,20 @@ class RenderHandler : public CefRenderHandler
       GstMapInfo map;
       if (gst_buffer_map(new_buffer, &map, GST_MAP_WRITE)) {
         CUDA_MEMCPY2D copyParam = {};
+        copyParam.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+        copyParam.srcArray = cuda_array;
         copyParam.dstMemoryType = CU_MEMORYTYPE_HOST;
         copyParam.dstHost = map.data;
         copyParam.dstPitch = dst_stride;
         copyParam.WidthInBytes = width * 4;
         copyParam.Height = height;
 
-        if (egl_frame.frameType == CU_EGL_FRAME_TYPE_ARRAY) {
-          // Tiled NVIDIA memory — use CUDA array copy which handles de-tiling
-          copyParam.srcMemoryType = CU_MEMORYTYPE_ARRAY;
-          copyParam.srcArray = egl_frame.frame.pArray[0];
-        } else {
-          // Linear pitched memory
-          copyParam.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-          copyParam.srcDevice = (CUdeviceptr)egl_frame.frame.pPitch[0];
-          copyParam.srcPitch = egl_frame.pitch;
-        }
-
         res = cuMemcpy2D(&copyParam);
         gst_buffer_unmap(new_buffer, &map);
         if (res != CUDA_SUCCESS) {
-          GST_ERROR_OBJECT(src, "cuMemcpy2D failed: %d (frameType=%s)", res,
-                           egl_frame.frameType == CU_EGL_FRAME_TYPE_ARRAY ? "ARRAY" : "PITCH");
+          GST_ERROR_OBJECT(src, "cuMemcpy2D failed: %d", res);
           gst_buffer_unref(new_buffer);
+          cuGraphicsUnmapResources(1, &cuda_resource, 0);
           cuGraphicsUnregisterResource(cuda_resource);
           eglDestroyImage(src->egl_display, egl_image);
           cuCtxPopCurrent(NULL);
@@ -516,13 +568,15 @@ class RenderHandler : public CefRenderHandler
       } else {
         GST_ERROR_OBJECT(src, "Failed to map output buffer");
         gst_buffer_unref(new_buffer);
+        cuGraphicsUnmapResources(1, &cuda_resource, 0);
         cuGraphicsUnregisterResource(cuda_resource);
         eglDestroyImage(src->egl_display, egl_image);
         cuCtxPopCurrent(NULL);
         return;
       }
 
-      // Cleanup per-frame EGL/CUDA resources
+      // Cleanup per-frame resources
+      cuGraphicsUnmapResources(1, &cuda_resource, 0);
       cuGraphicsUnregisterResource(cuda_resource);
       eglDestroyImage(src->egl_display, egl_image);
 
@@ -537,7 +591,7 @@ class RenderHandler : public CefRenderHandler
 
       cuCtxPopCurrent(NULL);
 
-      // Dump first pixel of first few frames for diagnostics (before handing off buffer)
+      // Dump first pixels for diagnostics
       if (src->accel_frame_count < 3) {
         GstMapInfo dbg_map;
         if (gst_buffer_map(new_buffer, &dbg_map, GST_MAP_READ)) {
@@ -563,7 +617,7 @@ class RenderHandler : public CefRenderHandler
       gst_buffer_unref (new_buffer);
       GST_OBJECT_UNLOCK (src);
 
-      GST_LOG_OBJECT(src, "OnAcceleratedPaint EGL+CUDA frame: %dx%d stride=%d", width, height, stride);
+      GST_LOG_OBJECT(src, "OnAcceleratedPaint GL interop frame: %dx%d", width, height);
     }
 #endif
 
@@ -1704,6 +1758,16 @@ gst_cef_src_finalize (GObject *object)
     gst_object_unref (src->dmabuf_allocator);
     src->dmabuf_allocator = NULL;
   }
+  if (src->gl_texture && src->egl_context != EGL_NO_CONTEXT) {
+    eglMakeCurrent(src->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, src->egl_context);
+    glDeleteTextures(1, &src->gl_texture);
+    src->gl_texture = 0;
+  }
+  if (src->egl_context != EGL_NO_CONTEXT) {
+    eglMakeCurrent(src->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroyContext(src->egl_display, src->egl_context);
+    src->egl_context = EGL_NO_CONTEXT;
+  }
   if (src->egl_display != EGL_NO_DISPLAY) {
     eglTerminate(src->egl_display);
     src->egl_display = EGL_NO_DISPLAY;
@@ -1747,6 +1811,9 @@ gst_cef_src_init (GstCefSrc * src)
   src->accelerated_paint_active = FALSE;
   src->cuda_ctx = NULL;
   src->egl_display = EGL_NO_DISPLAY;
+  src->egl_context = EGL_NO_CONTEXT;
+  src->gl_texture = 0;
+  src->glEGLImageTargetTexture2DOES = NULL;
 #endif
   src->chromium_debug_port = DEFAULT_CHROMIUM_DEBUG_PORT;
 
