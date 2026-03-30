@@ -145,8 +145,10 @@ if (NOT APPLE)
   target_include_directories("gstcefsubprocess" PUBLIC ${GST_INCLUDE_DIRS})
   set_target_properties("gstcefsubprocess" PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE)
   set_target_properties("gstcefsubprocess" PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CEF_TARGET_OUT_DIR})
-  # Match the .exe suffix expected by gstcefsrc.cc browser_subprocess_path on non-Apple platforms
-  set_target_properties("gstcefsubprocess" PROPERTIES SUFFIX ".exe")
+  # Match the .exe suffix expected by gstcefsrc.cc browser_subprocess_path on Windows
+  if(WIN32)
+    set_target_properties("gstcefsubprocess" PROPERTIES SUFFIX ".exe")
+  endif()
 
   install(
     TARGETS "gstcefsubprocess"

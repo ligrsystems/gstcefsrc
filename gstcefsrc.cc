@@ -915,8 +915,10 @@ init_cef (GstCefSrc *src)
 
 #ifdef __APPLE__
   gchar* browser_subprocess_path = g_build_filename(base_path, "gstcefsubprocess.app/Contents/MacOS/gstcefsubprocess", nullptr);
-#else
+#elif defined(_WIN32)
   gchar* browser_subprocess_path = g_build_filename(base_path, "gstcefsubprocess.exe", nullptr);
+#else
+  gchar* browser_subprocess_path = g_build_filename(base_path, "gstcefsubprocess", nullptr);
 #endif
   if (const gchar *custom_subprocess_path = g_getenv ("GST_CEF_SUBPROCESS_PATH")) {
     g_setenv ("CEF_SUBPROCESS_PATH", browser_subprocess_path, TRUE);
