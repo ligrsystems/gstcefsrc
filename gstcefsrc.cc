@@ -2,6 +2,7 @@
 #include <glib.h>
 #include <sstream>
 #include <string>
+#include <mutex>
 
 #ifdef __APPLE__
 #include <memory>
@@ -367,10 +368,25 @@ class AudioHandler : public CefAudioHandler
     {
     }
 
+    /* Called from BrowserClient::OnBeforeClose (CEF UI thread) before the
+     * GstCefSrc element is torn down. Takes mLock so it waits for any in-flight
+     * audio-thread callback to finish, then drops the element pointer so later
+     * callbacks (CEF's audio thread can fire them after the browser closes)
+     * become no-ops instead of dereferencing freed memory. */
+    void Invalidate()
+    {
+      std::lock_guard<std::mutex> lock(mLock);
+      src = nullptr;
+    }
+
   void OnAudioStreamStarted(CefRefPtr<CefBrowser> browser,
                             const CefAudioParameters& params,
                             int channels) override
   {
+    std::lock_guard<std::mutex> lock(mLock);
+    if (!src)
+      return;
+
     GstStructure *s = gst_structure_new ("cef-audio-stream-start",
         "channels", G_TYPE_INT, channels,
         "rate", G_TYPE_INT, params.sample_rate,
@@ -393,6 +409,10 @@ class AudioHandler : public CefAudioHandler
     GstBuffer *buf;
     GstMapInfo info;
     gint i, j;
+
+    std::lock_guard<std::mutex> lock(mLock);
+    if (!src)
+      return;
 
     GST_LOG_OBJECT (src, "Handling audio stream packet with %d frames", frames);
 
@@ -428,6 +448,9 @@ class AudioHandler : public CefAudioHandler
 
   void OnAudioStreamError(CefRefPtr<CefBrowser> browser,
                           const CefString& message) override {
+    std::lock_guard<std::mutex> lock(mLock);
+    if (!src)
+      return;
     GST_WARNING_OBJECT (src, "Audio stream error: %s", message.ToString().c_str());
   }
 
@@ -436,6 +459,9 @@ class AudioHandler : public CefAudioHandler
     GstCefSrc *src;
     gint mRate;
     gint mChannels;
+    /* Guards `src` against the teardown race: audio callbacks run on CEF's
+     * audio thread and can fire while/after the element is being finalized. */
+    std::mutex mLock;
     IMPLEMENT_REFCOUNTING(AudioHandler);
 };
 
@@ -581,6 +607,13 @@ class BrowserClient :
 
     virtual void OnBeforeClose(CefRefPtr<CefBrowser> browser) override
     {
+      /* Drop the audio handler's element pointer before marking the browser
+       * closed: gst_cef_src_stop() waits on CEF_SRC_CLOSED before the element is
+       * freed, so invalidating here guarantees no late audio-thread callback
+       * dereferences freed memory (see AudioHandler::Invalidate). */
+      if (audio_handler)
+        audio_handler->Invalidate();
+
       g_mutex_lock (&src->state_lock);
       src->browser = nullptr;
       src->state = CEF_SRC_CLOSED;
@@ -658,7 +691,8 @@ class BrowserClient :
     std::unique_ptr<CefMessageRouterBrowserSide::Handler> browser_msg_handler_;
 
     CefRefPtr<CefRenderHandler> render_handler;
-    CefRefPtr<CefAudioHandler> audio_handler;
+    /* Concrete type (not CefAudioHandler) so OnBeforeClose can call Invalidate() */
+    CefRefPtr<AudioHandler> audio_handler;
     CefRefPtr<CefDisplayHandler> display_handler;
 
   public:
