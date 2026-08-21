@@ -63,6 +63,7 @@ struct _GstCefSrc {
   gboolean sandbox;
   gboolean listen_for_js_signals;
   gint chromium_debug_port;
+  gint paint_rate;
   CefRefPtr<CefBrowser> browser;
   CefRefPtr<CefApp> app;
 

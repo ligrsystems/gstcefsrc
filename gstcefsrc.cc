@@ -136,6 +136,7 @@ enum
   PROP_URL,
   PROP_GPU,
   PROP_CHROMIUM_DEBUG_PORT,
+  PROP_PAINT_RATE,
   PROP_CHROME_EXTRA_FLAGS,
   PROP_SANDBOX,
   PROP_LISTEN_FOR_JS_SIGNAL,
@@ -1317,6 +1318,11 @@ gst_cef_src_set_caps (GstBaseSrc * base_src, GstCaps * caps)
   if (src->browser) {
     CefRefPtr<CefBrowser> browser = src->browser;
     int fps = (int)gst_util_uint64_scale (1, src->vinfo.fps_n, src->vinfo.fps_d);
+    if (src->paint_rate > 0 && src->paint_rate < fps) {
+      GST_INFO_OBJECT (src, "Capping browser paint rate to %d (stream fps %d)",
+          src->paint_rate, fps);
+      fps = src->paint_rate;
+    }
     CefPostTask (TID_UI,
         base::BindOnce ([](CefRefPtr<CefBrowser> b, int rate) {
           CEF_REQUIRE_UI_THREAD();
@@ -1388,6 +1394,9 @@ gst_cef_src_set_property (GObject * object, guint prop_id, const GValue * value,
       src->chromium_debug_port = g_value_get_int (value);
       break;
     }
+    case PROP_PAINT_RATE:
+      src->paint_rate = g_value_get_int (value);
+      break;
     case PROP_SANDBOX:
     {
       GST_WARNING_OBJECT(
@@ -1460,6 +1469,9 @@ gst_cef_src_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_CHROMIUM_DEBUG_PORT:
       g_value_set_int (value, src->chromium_debug_port);
       break;
+    case PROP_PAINT_RATE:
+      g_value_set_int (value, src->paint_rate);
+      break;
     case PROP_SANDBOX:
       g_value_set_boolean (value, src->sandbox);
       break;
@@ -1522,6 +1534,7 @@ gst_cef_src_init (GstCefSrc * src)
   src->texture_reader = nullptr;
 #endif
   src->chromium_debug_port = DEFAULT_CHROMIUM_DEBUG_PORT;
+  src->paint_rate = 0;
 
   /* Default video info so GetViewRect returns sensible values before caps */
   gst_video_info_set_format(&src->vinfo, GST_VIDEO_FORMAT_BGRA, DEFAULT_WIDTH, DEFAULT_HEIGHT);
@@ -1568,6 +1581,14 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
           "Set chromium debug port (-1 = disabled) - "
           "deprecated: set GST_CEF_CHROME_EXTRA_FLAGS in the environment instead", -1, G_MAXUINT16,
           DEFAULT_CHROMIUM_DEBUG_PORT, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
+
+  g_object_class_install_property (gobject_class, PROP_PAINT_RATE,
+    g_param_spec_int ("paint-rate", "paint-rate",
+          "Cap the browser paint/composite rate (fps) independently of the "
+          "negotiated stream framerate (0 = follow the stream framerate). "
+          "The source duplicates the last painted frame up to the stream rate.",
+          0, 240, 0,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
 
   g_object_class_install_property (gobject_class, PROP_CHROME_EXTRA_FLAGS,
     g_param_spec_string ("chrome-extra-flags", "chrome-extra-flags",
