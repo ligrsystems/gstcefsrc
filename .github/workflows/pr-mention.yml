@@ -1,0 +1,23 @@
+name: PR Mention
+
+# Thin stub: the real workflow is reusable-pr-mention.yml in
+# ligrsystems/claude-dev-plugin, shared by every ligrsystems repo. Change
+# mention behavior there, never here — this file must stay identical
+# across repos.
+#
+# Mention @ligr in a PR comment to trigger a dev review (or a walkthrough
+# refresh, if the comment asks for a summary/walkthrough/overview).
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  mention:
+    uses: ligrsystems/claude-dev-plugin/.github/workflows/reusable-pr-mention.yml@main
+    secrets: inherit
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write

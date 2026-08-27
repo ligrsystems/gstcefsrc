@@ -1,0 +1,36 @@
+name: PR Walkthrough
+
+# Thin stub: the real workflow is reusable-pr-walkthrough.yml in
+# ligrsystems/claude-dev-plugin, shared by every ligrsystems repo. Change
+# walkthrough behavior there (or in its walkthrough skill), never here —
+# this file must stay identical across repos.
+#
+# Refresh a PR's walkthrough: Actions → PR Walkthrough → Run workflow
+# with the PR number. Skip a PR: add the `no-walkthrough` label.
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to (re)generate the walkthrough for
+        required: true
+
+concurrency:
+  group: pr-walkthrough-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  walkthrough:
+    uses: ligrsystems/claude-dev-plugin/.github/workflows/reusable-pr-walkthrough.yml@main
+    with:
+      pr_number: ${{ inputs.pr_number || '' }}
+    secrets: inherit
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      # Read: the reaction-cleanup steps list the sibling workflow's runs.
+      actions: read
+      id-token: write
