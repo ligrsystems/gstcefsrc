@@ -1,0 +1,36 @@
+name: PR Dev Review
+
+# Thin stub: the real workflow is reusable-pr-dev-review.yml in
+# ligrsystems/claude-dev-plugin, shared by every ligrsystems repo. Change
+# review behavior there (or in its review skill), never here — this file
+# must stay identical across repos.
+#
+# Refresh a PR's review: Actions → PR Dev Review → Run workflow with the
+# PR number. Skip a PR: add the `no-review` label.
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to (re)generate the dev review for
+        required: true
+
+concurrency:
+  group: pr-dev-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  dev-review:
+    uses: ligrsystems/claude-dev-plugin/.github/workflows/reusable-pr-dev-review.yml@main
+    with:
+      pr_number: ${{ inputs.pr_number || '' }}
+    secrets: inherit
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      # Read: the reaction-cleanup steps list the sibling workflow's runs.
+      actions: read
+      id-token: write
