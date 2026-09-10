@@ -39,6 +39,10 @@ Eight portable C++ tests cover layout, buffer ownership, demux ownership, diagno
 They require a C++14 compiler, pthreads, pkg-config, and GStreamer core, video, audio, and Check development files.
 The clock test requires GStreamer Check 1.18 or later for `gst_test_clock_process_id`.
 It uses `GstTestClock` without CEF, CUDA, a display, or a GPU.
+The lifetime test requires automatic parent-buffer metadata on GStreamer 1.24 and later, including the required CUDA runtime version 1.26.
+Older core versions without automatic parent metadata discard returned pool buffers with shared memory instead.
+Some 1.22 maintenance releases backport automatic parent retention; the test validates that metadata whenever it exists.
+Timestamp independence, held-memory non-reuse, and pixel immutability remain mandatory test assertions on every supported core version.
 On Ubuntu, `libgstreamer1.0-dev` supplies `gstreamer-check-1.0.pc`, the clock-test headers, and the Check library.
 The existing `libgstreamer-plugins-base1.0-dev` dependency installs that core development package.
 See the [Ubuntu package files](https://packages.ubuntu.com/jammy/amd64/libgstreamer1.0-dev/filelist) and [dependency list](https://packages.ubuntu.com/jammy/libgstreamer-plugins-base1.0-dev).
