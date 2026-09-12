@@ -170,7 +170,6 @@ enum
   PROP_URL,
   PROP_GPU,
 #ifdef GST_CEF_ENABLE_CUDA
-  PROP_CUDA_MEMORY,
   PROP_CUDA_DIAGNOSTIC_PAIRS,
   PROP_CUDA_PAIR_DELAY_US,
 #endif
@@ -1385,9 +1384,9 @@ gst_cef_src_start(GstBaseSrc *base_src)
   if (src->cuda_diagnostic_pairs) {
     gint num_buffers = -1;
     g_object_get(src, "num-buffers", &num_buffers, nullptr);
-    if (!src->cuda_memory || (num_buffers > 0 && num_buffers % 2 != 0)) {
+    if (num_buffers > 0 && num_buffers % 2 != 0) {
       GST_ELEMENT_ERROR(src, RESOURCE, SETTINGS,
-          ("CUDA diagnostic pairs require cuda-memory=true and an even num-buffers limit"), (nullptr));
+          ("CUDA diagnostic pairs require an even num-buffers limit"), (nullptr));
       return FALSE;
     }
     GST_WARNING_OBJECT(src, "CUDA paired-copy diagnostics enabled: delay=%u us; output is not a performance benchmark", src->cuda_pair_delay_us);
@@ -1712,7 +1711,7 @@ gst_cef_src_set_caps (GstBaseSrc * base_src, GstCaps * caps)
 #ifdef GST_CEF_ENABLE_CUDA
   bool cuda_caps = gst_caps_features_contains(gst_caps_get_features(caps, 0), GST_CAPS_FEATURE_MEMORY_CUDA_MEMORY);
   if (cuda_caps != bool(src->cuda_memory)) {
-    GST_ERROR_OBJECT(src, "cuda-memory must match negotiated CUDA caps"); return FALSE;
+    GST_ERROR_OBJECT(src, "negotiated caps must carry memory:CUDAMemory"); return FALSE;
   }
   // Context discovery can call set_context; do not hold the object lock here.
   if (cuda_caps && (!gst_cuda_load_library() ||
@@ -1822,12 +1821,6 @@ gst_cef_src_set_property (GObject * object, guint prop_id, const GValue * value,
       if (prop_id == PROP_CUDA_DIAGNOSTIC_PAIRS) src->cuda_diagnostic_pairs = g_value_get_boolean(value);
       else src->cuda_pair_delay_us = g_value_get_uint(value);
       break;
-    case PROP_CUDA_MEMORY:
-      if (GST_STATE(src) != GST_STATE_NULL) {
-        GST_WARNING_OBJECT(src, "cuda-memory can only change in NULL state"); break;
-      }
-      src->cuda_memory = g_value_get_boolean(value);
-      break;
 #endif
     case PROP_GPU:
     {
@@ -1925,9 +1918,6 @@ gst_cef_src_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_CUDA_PAIR_DELAY_US:
       g_value_set_uint(value, src->cuda_pair_delay_us);
       break;
-    case PROP_CUDA_MEMORY:
-      g_value_set_boolean(value, src->cuda_memory);
-      break;
 #endif
     case PROP_GPU:
       g_value_set_boolean (value, src->gpu);
@@ -2006,7 +1996,8 @@ gst_cef_src_init (GstCefSrc * src)
 
   src->n_frames = 0;
 #ifdef GST_CEF_ENABLE_CUDA
-  src->cuda_memory = FALSE;
+  // CUDA builds always deliver owned CUDA frames. There is no system-memory path.
+  src->cuda_memory = TRUE;
   src->cuda_publish_sequence = 0;
   src->cuda_selected_sequence = 0;
   src->cuda_frames = new GpuFrameQueue();
@@ -2068,9 +2059,6 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
           DEFAULT_URL, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT)));
 
 #ifdef GST_CEF_ENABLE_CUDA
-  g_object_class_install_property(gobject_class, PROP_CUDA_MEMORY,
-      g_param_spec_boolean("cuda-memory", "CUDA memory", "Experimental owned Linux CUDA output; set before READY",
-          FALSE, GParamFlags(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
   g_object_class_install_property(gobject_class, PROP_CUDA_DIAGNOSTIC_PAIRS,
       g_param_spec_boolean("cuda-diagnostic-pairs", "CUDA diagnostic pairs",
           "Test only: emit two independent copies per sampled callback; excludes synthetic repeats and startup blank frames",
