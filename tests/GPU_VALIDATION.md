@@ -17,16 +17,15 @@ cmake --build build-cuda --parallel 8
 The external CEF root is independent of CUDA support and also builds the CEF152 CPU comparison arm.
 
 CUDA builds always output owned CUDA frames. There is no property to set.
-The source then advertises only `video/x-raw(memory:CUDAMemory),format=BGRA`.
-A CUDA-enabled build still defaults to ordinary CPU output.
+The source advertises only `video/x-raw(memory:CUDAMemory),format=BGRA`.
 The `gpu` property controls browser rendering and does not select CUDA output.
-CEF initializes GPU settings once per process. Set `GST_CEF_GPU_ENABLED=1` before creating mixed CPU/CUDA comparison sources.
+A CPU comparison arm requires a separate build with `GST_CEF_ENABLE_CUDA=OFF`, in its own process.
+CEF initializes GPU settings once per process. Set `GST_CEF_GPU_ENABLED=1` before starting either process.
 
 Linux CUDA mode defaults to `use-angle=gl-egl` and `ozone-platform=x11` during CEF startup.
 The plugin applies these defaults after parsing `chrome-extra-flags` or `GST_CEF_CHROME_EXTRA_FLAGS`.
-Explicit switches retain their values. CPU mode does not add these defaults.
+Explicit switches retain their values. A non-CUDA build does not add these defaults.
 The first source initializes CEF for the whole process.
-If a CPU source initializes CEF first, also set `GST_CEF_CHROME_EXTRA_FLAGS=use-angle=gl-egl,ozone-platform=x11` before startup.
 
 These defaults require an X11 display and native EGL DMA-BUF import for the allocated buffer's format and modifier.
 ANGLE's GLX backend does not expose the required DMA-BUF import extension.
