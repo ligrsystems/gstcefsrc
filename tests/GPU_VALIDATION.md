@@ -16,7 +16,7 @@ cmake --build build-cuda --parallel 8
 `GST_CEF_ENABLE_CUDA` defaults to `OFF`.
 The external CEF root is independent of CUDA support and also builds the CEF152 CPU comparison arm.
 
-Set `cuda-memory=true` before the element enters READY.
+CUDA builds always output owned CUDA frames. There is no property to set.
 The source then advertises only `video/x-raw(memory:CUDAMemory),format=BGRA`.
 A CUDA-enabled build still defaults to ordinary CPU output.
 The `gpu` property controls browser rendering and does not select CUDA output.
@@ -52,7 +52,7 @@ Example pixel-proof pipeline:
 
 ```sh
 GST_CEF_GPU_ENABLED=1 gst-launch-1.0 -e \
-  cefsrc cuda-memory=true url=file:///fixtures/pixels.html ! \
+  cefsrc url=file:///fixtures/pixels.html ! \
   'video/x-raw(memory:CUDAMemory),format=BGRA,width=1920,height=1080,framerate=60/1' ! \
   cefdemux name=d d.video ! cudadownload ! \
   'video/x-raw,format=BGRA' ! filesink location=/tmp/proof.bgra \
@@ -221,7 +221,7 @@ For 120 warmup samples and 300 measured samples, capture exactly 840 raw frames:
 
 ```sh
 GST_CEF_GPU_ENABLED=1 gst-launch-1.0 -e \
-  cefsrc cuda-memory=true cuda-diagnostic-pairs=true cuda-pair-delay-us=1000 \
+  cefsrc cuda-diagnostic-pairs=true cuda-pair-delay-us=1000 \
   num-buffers=840 url=file:///fixtures/sync.html ! \
   'video/x-raw(memory:CUDAMemory),format=BGRA,width=1920,height=1080,framerate=60/1' ! \
   cefdemux name=d d.video ! cudadownload ! \
