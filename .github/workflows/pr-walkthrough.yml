@@ -196,8 +196,12 @@ jobs:
         # Pinned to the commit behind v1: the job holds a secret and write
         # perms, so no floating tags. Bump deliberately.
         uses: anthropics/claude-code-action@6b082c41935b4c8a3b8b0ef85ba4ba4d9eeb8975 # v1
+        env:
+          # Route the Claude Code harness at OpenRouter. Its Anthropic skin
+          # speaks the same API, so only the endpoint changes.
+          ANTHROPIC_BASE_URL: https://openrouter.ai/api
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.OPENROUTER_API_KEY }}
           prompt: |
             You are generating the reviewer-orientation comment for pull request
             #${{ github.event.pull_request.number || inputs.pr_number }} in ${{ github.repository }}.
@@ -298,7 +302,7 @@ jobs:
               small files (skim the diff) and deep-read only the 5-10 most
               significant ones. Do not read every file completely.
           claude_args: |
-            --model ${{ vars.PR_WALKTHROUGH_MODEL || 'claude-sonnet-5' }}
+            --model ${{ vars.PR_WALKTHROUGH_MODEL || 'deepseek/deepseek-v4.1-flash' }}
             --max-turns 400
             --allowedTools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git merge-base:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(npx -y calldiff@0.5.0:*),Read,Grep,Glob"
 
