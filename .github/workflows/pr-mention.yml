@@ -243,22 +243,20 @@ jobs:
                (context.ts, authorization.ts, authentication.ts, Role.ts,
                session/token handling), CI/build changes, env/config surface,
                deleted or weakened tests.
-            4. Test evidence: what the added/changed tests assert; orphan
-               check (new packages/api *.test.ts must be imported by a
-               src/testUtil/*entry*.test.ts); net coverage direction.
+            4. Test problems: deleted or weakened tests, changed logic with
+               no test. Report them as risk signals.
 
             Output exactly this structure, nothing else (no preamble):
             ## What this PR does
-            Max 5 sentences. Note the requester's focus if given.
+            1-3 sentences, each starting with a verb: "Adds <feature>." /
+            "Fixes <bug> that occurs when <condition>." Note the requester's
+            focus if given.
 
             ## Risk signals
-            Bullets. Only signals actually present. "None found." otherwise.
+            Bullets, one sentence each. Only signals actually present.
+            "None found." otherwise.
 
-            ## Test evidence
-            What is tested, what is not, orphan-check result.
-
-            ## Suggested review order
-            Numbered files/areas in dependency order; reason max 10 words each.
+            HARD BUDGET: whole comment max 500 words.
           claude_args: |
             --model ${{ vars.PR_WALKTHROUGH_MODEL || 'deepseek/deepseek-v4.1-flash' }}
             --max-turns 400

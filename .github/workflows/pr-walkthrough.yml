@@ -8,8 +8,8 @@ name: PR Walkthrough
 # are stripped here: this repo's Actions logs are public.
 
 # Posts an automated reviewer-orientation comment on every published PR:
-# what it does, the shape of the call-flow change (via calldiff), risk
-# signals, test evidence, and a suggested review order.
+# what it does, the shape of the call-flow change (via calldiff), and
+# risk signals.
 #
 # Runs when a PR is published (opened non-draft, or marked ready for
 # review). It does NOT re-run on every push — refresh manually from the
@@ -240,21 +240,23 @@ jobs:
             or checked. Exactly this structure:
 
             ## What this PR does
-            Max 5 sentences.
+            1-3 sentences. Start each with a verb. Use these patterns:
+            "Adds <feature>." / "Fixes <bug> that occurs when <condition>." /
+            "Removes <thing>." Say what changes for the user or the system.
 
             ## Shape of the change
-            Curated calldiff output: per entrypoint, what appeared, disappeared,
-            or moved. One reading line under each block. Order by reviewer
-            importance. Format it exactly as described in SHAPE FORMATTING.
+            Curated calldiff output: max 3 entrypoints, each tree max 10
+            lines. Pick the ones a reviewer needs; drop the rest. One reading
+            line under each block. Format it exactly as described in SHAPE
+            FORMATTING.
 
             ## Risk signals
-            Bullets. Only signals actually present. If none: "None found."
+            Bullets, one sentence each. Only signals actually present. Include
+            test problems from C here: deleted or weakened tests, changed
+            logic with no test. If none: "None found."
 
-            ## Test evidence
-            What is tested. What is not. Orphan-check result.
-
-            ## Suggested review order
-            Numbered files/areas, dependency order. Reason max 10 words each.
+            Do not add any other section. No test-evidence section, no review
+            order.
 
             SHAPE FORMATTING (the "Shape of the change" section only):
             - Group the call trees by file. Head each group with a link to that
@@ -288,9 +290,10 @@ jobs:
               "comprehensive", no adjective that does not change the meaning.
             - State the fact, then why the reviewer cares. Nothing else.
             - Prefer a bullet or table over a paragraph.
-            - Budget: whole comment under 120 lines. Summary max 5 sentences.
-              Each risk bullet max 2 sentences. Each reading line max 15 words.
-              If you exceed the budget, cut detail, never the section.
+            - HARD BUDGET: whole comment max 500 words, code blocks included.
+              Each reading line max 15 words. Count before you finish. If you
+              exceed the budget, cut detail, never the section. A short
+              walkthrough a reviewer reads beats a full one they skip.
 
             SAFETY RULES:
             - Never include secrets or credential values, even if present in
@@ -351,6 +354,13 @@ jobs:
 
           if ! cmp -s "$RUNNER_TEMP/raw.md" "$RUNNER_TEMP/walkthrough.md"; then
             echo "::warning::Stripped preamble before the first heading."
+          fi
+
+          # The prompt caps the comment at 500 words. Warn when it runs over;
+          # never block the post.
+          WORDS=$(wc -w < "$RUNNER_TEMP/walkthrough.md" | tr -d ' ')
+          if [ "$WORDS" -gt 500 ]; then
+            echo "::warning::Walkthrough is $WORDS words, over the 500-word budget."
           fi
 
           # Cost stats live on the result event in the execution file. They
