@@ -186,6 +186,11 @@ jobs:
             - What happens when this fails? Are errors surfaced or silently swallowed?
             - Are there race conditions, timing issues, or state inconsistencies?
 
+            FALLBACKS:
+            - Flag any new code that silently switches to a different provider, model, service, endpoint, data source, or code path when the first one is missing or fails. Examples: "use OpenRouter, else OpenAI, else Anthropic"; "try the Responses API, else Chat Completions"; `catch { return legacyPath() }`.
+            - A fallback hides the failure and changes behavior without a code change. The fix is one path. If that path fails, fail loudly by name, or turn the feature off explicitly and log why.
+            - Do not flag: retries against the same target, default values for optional inputs, or an explicit off switch that logs the reason.
+
             REACT PATTERNS (FRONTEND CHANGES):
             - Check against the **React Patterns** section in AGENTS.md — specifically flag: unnecessary useEffect (derived state, event handling, parent notifications), duplicated useState that should be a single object, broken rules of hooks, oversized components, missing keys or index-as-key, premature memoization
             - Are components composed via children/slots, or are they using deep prop drilling or render props unnecessarily?
