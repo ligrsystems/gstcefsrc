@@ -16,6 +16,14 @@
 class D3D11TextureReader;
 #endif
 
+#ifdef GST_CEF_ENABLE_CUDA
+#include <gst/cuda/gstcuda.h>
+class LinuxCudaFrame;
+class GpuPairQueue;
+class GpuFrameQueue;
+class GpuFrameClock;
+#endif
+
 G_BEGIN_DECLS
 
 #define GST_TYPE_CEF_SRC \
@@ -60,6 +68,24 @@ struct _GstCefSrc {
   cef_log_severity_t log_severity;
   gchar *cef_cache_location;
   gboolean gpu;
+#ifdef GST_CEF_ENABLE_CUDA
+  gboolean cuda_memory;
+  guint64 cuda_publish_sequence;
+  guint64 cuda_selected_sequence;
+  GpuFrameQueue* cuda_frames;
+  GpuFrameClock* cuda_clock;
+  gboolean cuda_failed;
+  gboolean cuda_stopping;
+  gboolean cuda_popup_visible;
+  gint cuda_popup_x, cuda_popup_y, cuda_popup_width, cuda_popup_height;
+  gboolean cuda_diagnostic_pairs;
+  gboolean cuda_pair_flushing;
+  guint cuda_pair_delay_us;
+  GCond cuda_pair_cond;
+  GpuPairQueue* cuda_pairs;
+  GstCudaContext* cuda_context;
+  LinuxCudaFrame* cuda_frame;
+#endif
   gboolean sandbox;
   gboolean listen_for_js_signals;
   gint chromium_debug_port;
