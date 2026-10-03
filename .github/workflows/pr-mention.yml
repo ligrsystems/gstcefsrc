@@ -207,7 +207,7 @@ jobs:
             ## What's missing
             Tests, docs, companion PRs. "Nothing." otherwise.
           claude_args: |
-            --model ${{ vars.PR_DEV_REVIEW_MODEL || 'deepseek/deepseek-v4.1-flash' }}
+            --model ${{ vars.PR_DEV_REVIEW_MODEL || 'z-ai/glm-5.3-flash' }}
             --max-turns 400
             --allowedTools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git merge-base:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr list:*),Read,Grep,Glob"
 
@@ -258,7 +258,7 @@ jobs:
 
             HARD BUDGET: whole comment max 500 words.
           claude_args: |
-            --model ${{ vars.PR_WALKTHROUGH_MODEL || 'deepseek/deepseek-v4.1-flash' }}
+            --model ${{ vars.PR_WALKTHROUGH_MODEL || 'z-ai/glm-5.3-flash' }}
             --max-turns 400
             --allowedTools "Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git merge-base:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr list:*),Read,Grep,Glob"
 
