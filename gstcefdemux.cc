@@ -3,7 +3,7 @@
 #include "gstcefdemux.h"
 #include "gstcefaudiometa.h"
 
-#define CEF_VIDEO_CAPS "video/x-raw, format=BGRA, width=[1, 2147483647], height=[1, 2147483647], framerate=[1/1, 60/1], pixel-aspect-ratio=1/1"
+#include "gstcef_video_caps.h"
 #define CEF_AUDIO_CAPS "audio/x-raw, format=F32LE, rate=[1, 2147483647], channels=[1, 2147483647], layout=interleaved"
 
 #define GST_CAT_DEFAULT gst_cef_demux_debug
@@ -196,6 +196,9 @@ gst_cef_demux_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
   gpointer state = NULL;
   GList *tmp;
   GstFlowReturn ret = GST_FLOW_OK;
+  // Downstream owns the buffer after gst_pad_push and can release or modify it.
+  const GstClockTime video_timestamp = GST_BUFFER_PTS(buffer);
+  const GstClockTime video_duration = GST_BUFFER_DURATION(buffer);
 
   gst_cef_demux_push_events (demux);
 
@@ -224,20 +227,20 @@ gst_cef_demux_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
   ret = gst_flow_combiner_update_pad_flow (demux->flow_combiner, demux->vsrcpad,
       gst_pad_push (demux->vsrcpad, buffer));
 
-  if (!GST_CLOCK_TIME_IS_VALID(demux->last_audio_time) || demux->last_audio_time < GST_BUFFER_PTS (buffer)) {
+  if (!GST_CLOCK_TIME_IS_VALID(demux->last_audio_time) || demux->last_audio_time < video_timestamp) {
     GstClockTime duration, timestamp;
 
     if (!GST_CLOCK_TIME_IS_VALID(demux->last_audio_time)) {
-      timestamp = GST_BUFFER_PTS (buffer);
-      duration = GST_BUFFER_DURATION (buffer);
+      timestamp = video_timestamp;
+      duration = video_duration;
     } else {
       timestamp = demux->last_audio_time;
-      duration = GST_BUFFER_PTS (buffer) - demux->last_audio_time;
+      duration = video_timestamp - demux->last_audio_time;
     }
 
     gst_pad_push_event (demux->asrcpad, gst_event_new_gap (timestamp, duration));
 
-    demux->last_audio_time = GST_BUFFER_PTS (buffer);
+    demux->last_audio_time = video_timestamp;
   }
 
   if (ret != GST_FLOW_OK)

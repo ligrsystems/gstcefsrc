@@ -3,6 +3,7 @@
 #include <sstream>
 #include <string>
 #include <mutex>
+#include <memory>
 
 #ifdef __APPLE__
 #include <memory>
@@ -20,6 +21,13 @@
 
 #include "gstcefsrc.h"
 #include "gstcefaudiometa.h"
+#ifdef GST_CEF_ENABLE_CUDA
+#include "cef_cuda_startup.h"
+#include "linux_cuda_frame.h"
+#include "gpu_pair_queue.h"
+#include "gpu_frame_queue.h"
+#include "gpu_frame_clock.h"
+#endif
 #ifdef _WIN32
 #include "d3d11_texture_reader.h"
 #include <objbase.h>
@@ -43,6 +51,32 @@ GST_DEBUG_CATEGORY_STATIC (cef_src_debug);
 #define GST_CAT_DEFAULT cef_src_debug
 
 GST_DEBUG_CATEGORY_STATIC (cef_console_debug);
+#ifdef GST_CEF_ENABLE_CUDA
+GST_DEBUG_CATEGORY_STATIC (cef_cadence_debug);
+#endif
+
+
+#ifdef GST_CEF_ENABLE_CUDA
+// The caller holds the object lock and runs on the CEF UI thread.
+static bool gst_cef_src_apply_popup_locked(GstCefSrc* src, std::string& error) {
+  GstBuffer* output = nullptr;
+  if (src->cuda_diagnostic_pairs && src->cuda_popup_visible) {
+    error = "native popups are outside the paired full-frame diagnostic contract";
+  } else if (src->cuda_frame) {
+    CefRect bounds(src->cuda_popup_x, src->cuda_popup_y, src->cuda_popup_width, src->cuda_popup_height);
+    output = src->cuda_frame->UpdatePopup(src->cuda_popup_visible, bounds, error);
+  }
+  if (output) {
+    ++src->cuda_publish_sequence;
+    src->cuda_frames->Reset(&src->current_buffer, &src->cuda_selected_sequence,
+        output, src->cuda_publish_sequence);
+    GST_CAT_LOG_OBJECT(cef_cadence_debug, src, "cadence publish seq=%" G_GUINT64_FORMAT " monotonic_us=%" G_GINT64_FORMAT " kind=popup-state",
+        src->cuda_publish_sequence, g_get_monotonic_time());
+    gst_buffer_unref(output);
+  }
+  return error.empty();
+}
+#endif
 
 #define DEFAULT_WIDTH 1920
 #define DEFAULT_HEIGHT 1080
@@ -135,6 +169,10 @@ enum
   PROP_0,
   PROP_URL,
   PROP_GPU,
+#ifdef GST_CEF_ENABLE_CUDA
+  PROP_CUDA_DIAGNOSTIC_PAIRS,
+  PROP_CUDA_PAIR_DELAY_US,
+#endif
   PROP_CHROMIUM_DEBUG_PORT,
   PROP_PAINT_RATE,
   PROP_CHROME_EXTRA_FLAGS,
@@ -148,7 +186,7 @@ enum
 #define gst_cef_src_parent_class parent_class
 G_DEFINE_TYPE (GstCefSrc, gst_cef_src, GST_TYPE_PUSH_SRC);
 
-#define CEF_VIDEO_CAPS "video/x-raw, format=BGRA, width=[1, 2147483647], height=[1, 2147483647], framerate=[1/1, 60/1], pixel-aspect-ratio=1/1"
+#include "gstcef_video_caps.h"
 #define CEF_AUDIO_CAPS "audio/x-raw, format=F32LE, rate=[1, 2147483647], channels=[1, 2147483647], layout=interleaved"
 
 static GstStaticPadTemplate gst_cef_src_template =
@@ -264,6 +302,19 @@ class RenderHandler : public CefRenderHandler
 
     void OnPaint(CefRefPtr<CefBrowser> browser, PaintElementType type, const RectList &dirtyRects, const void * buffer, int w, int h) override
     {
+#ifdef GST_CEF_ENABLE_CUDA
+      if (src->cuda_memory) {
+        GST_OBJECT_LOCK(src);
+        if (src->cuda_stopping) { GST_OBJECT_UNLOCK(src); return; }
+        const bool first_error = !src->cuda_failed;
+        src->cuda_failed = TRUE;
+        g_cond_broadcast(&src->cuda_pair_cond);
+        GST_OBJECT_UNLOCK(src);
+        if (first_error) GST_ELEMENT_ERROR(src, RESOURCE, FAILED,
+            ("CPU paint received while CUDA output was requested"), (nullptr));
+        return;
+      }
+#endif
       GstBuffer *new_buffer;
       guint target_width, target_height;
       gsize target_size, source_size, copy_size;
@@ -291,6 +342,87 @@ class RenderHandler : public CefRenderHandler
 
       GST_LOG_OBJECT (src, "done painting");
     }
+
+#ifdef GST_CEF_ENABLE_CUDA
+    void OnPopupShow(CefRefPtr<CefBrowser> browser, bool show) override {
+      GST_DEBUG_OBJECT(src, "Native popup visibility: %d", show);
+      UpdatePopupState(show, nullptr);
+    }
+    void OnPopupSize(CefRefPtr<CefBrowser> browser, const CefRect& rect) override {
+      GST_DEBUG_OBJECT(src, "Native popup bounds: %d,%d %dx%d", rect.x, rect.y, rect.width, rect.height);
+      UpdatePopupState(false, &rect);
+    }
+
+    void OnAcceleratedPaint(CefRefPtr<CefBrowser> browser, PaintElementType type,
+                            const RectList& dirtyRects, const CefAcceleratedPaintInfo& info) override
+    {
+      if (!src->cuda_memory) return;
+      GST_CAT_LOG_OBJECT(cef_cadence_debug, src, "cadence callback monotonic_us=%" G_GINT64_FORMAT " kind=%s",
+          g_get_monotonic_time(), type == PET_POPUP ? "popup" : "view");
+      GST_OBJECT_LOCK(src);
+      GST_CAT_LOG_OBJECT(cef_cadence_debug, src, "cadence locked monotonic_us=%" G_GINT64_FORMAT " kind=%s",
+          g_get_monotonic_time(), type == PET_POPUP ? "popup" : "view");
+      if (!src->cuda_frame || src->cuda_failed || src->cuda_pair_flushing || src->cuda_stopping ||
+          src->cuda_frames->ResumePending()) { GST_OBJECT_UNLOCK(src); return; }
+      if (src->cuda_diagnostic_pairs && !src->cuda_pairs->CanAcceptPair()) {
+        GST_LOG_OBJECT(src, "Diagnostic queue full: skipping entire callback pair");
+        GST_OBJECT_UNLOCK(src); return;
+      }
+      std::string error;
+      GstBuffer* buffer = nullptr;
+      if (type == PET_POPUP) {
+        GST_LOG_OBJECT(src, "Accelerated native popup frame");
+        if (src->cuda_diagnostic_pairs) error = "native popups are outside the paired full-frame diagnostic contract";
+        else buffer = src->cuda_frame->CopyPopup(info, error);
+        if (!buffer && error.empty()) { GST_OBJECT_UNLOCK(src); return; }
+      } else if (CEF_MEMBER_EXISTS(&info, extra) && CEF_MEMBER_EXISTS(&info.extra, visible_rect) &&
+                 (info.extra.visible_rect.width != src->vinfo.width || info.extra.visible_rect.height != src->vinfo.height)) {
+        // An in-flight frame from the old size can arrive after renegotiation.
+        GST_DEBUG_OBJECT(src, "Skipping old-size accelerated frame");
+        GST_OBJECT_UNLOCK(src); return;
+      } else {
+        if (CEF_MEMBER_EXISTS(&info, extra) && CEF_MEMBER_EXISTS(&info.extra, visible_rect))
+        GST_LOG_OBJECT(src, "Accelerated input: format=%d planes=%d coded=%dx%d visible=%d,%d %dx%d stride=%u offset=%" G_GUINT64_FORMAT " modifier=%" G_GUINT64_FORMAT,
+            info.format, info.plane_count, info.extra.coded_size.width, info.extra.coded_size.height,
+            info.extra.visible_rect.x, info.extra.visible_rect.y, info.extra.visible_rect.width,
+            info.extra.visible_rect.height, info.planes[0].stride, info.planes[0].offset, info.modifier);
+        buffer = src->cuda_frame->Copy(info, error);
+        if (buffer && src->cuda_diagnostic_pairs) {
+          // CEF still owns this callback. Re-import the same borrowed frame after
+          // the delay; copying A's owned memory would hide producer readiness bugs.
+          if (src->cuda_pair_delay_us) g_usleep(src->cuda_pair_delay_us);
+          GstBuffer* second = src->cuda_frame->Copy(info, error);
+          if (!second || !src->cuda_pairs->Push(buffer, second)) {
+            if (second) error = "cannot enqueue a complete diagnostic pair";
+            gst_buffer_unref(buffer);
+            buffer = nullptr;
+          }
+          if (second) gst_buffer_unref(second);
+          g_cond_signal(&src->cuda_pair_cond);
+        }
+      }
+      if (buffer) {
+        if (!src->cuda_diagnostic_pairs) {
+          ++src->cuda_publish_sequence;
+          const guint64 dropped = src->cuda_frames->Push(buffer, src->cuda_publish_sequence);
+          if (dropped) GST_CAT_LOG_OBJECT(cef_cadence_debug, src, "cadence drop seq=%" G_GUINT64_FORMAT, dropped);
+          GST_CAT_LOG_OBJECT(cef_cadence_debug, src, "cadence publish seq=%" G_GUINT64_FORMAT " monotonic_us=%" G_GINT64_FORMAT " kind=%s",
+              src->cuda_publish_sequence, g_get_monotonic_time(), type == PET_POPUP ? "popup" : "view");
+        }
+        gst_buffer_unref(buffer);
+        GST_LOG_OBJECT(src, "Owned CUDA frame: format=%d coded=%dx%d visible=%d,%d %dx%d stride=%u offset=%" G_GUINT64_FORMAT " modifier=%" G_GUINT64_FORMAT,
+            info.format, info.extra.coded_size.width, info.extra.coded_size.height,
+            info.extra.visible_rect.x, info.extra.visible_rect.y, info.extra.visible_rect.width,
+            info.extra.visible_rect.height, info.planes[0].stride, info.planes[0].offset, info.modifier);
+      } else {
+        src->cuda_failed = TRUE;
+        g_cond_broadcast(&src->cuda_pair_cond);
+      }
+      GST_OBJECT_UNLOCK(src);
+      if (!buffer) GST_ELEMENT_ERROR(src, RESOURCE, FAILED,
+          ("CUDA browser frame transfer failed"), ("%s", error.c_str()));
+    }
+#endif
 
 #ifdef _WIN32
     void OnAcceleratedPaint(CefRefPtr<CefBrowser> browser,
@@ -350,6 +482,43 @@ class RenderHandler : public CefRenderHandler
 #endif
 
   private:
+
+#ifdef GST_CEF_ENABLE_CUDA
+    void UpdatePopupState(bool show, const CefRect* rect) {
+      if (!src->cuda_memory) return;
+      GST_OBJECT_LOCK(src);
+      if (src->cuda_failed || src->cuda_stopping) {
+        GST_OBJECT_UNLOCK(src); return;
+      }
+      const bool popup_changed = rect
+          ? (rect->x != src->cuda_popup_x || rect->y != src->cuda_popup_y ||
+             rect->width != src->cuda_popup_width || rect->height != src->cuda_popup_height)
+          : (show != bool(src->cuda_popup_visible));
+      if (popup_changed) src->cuda_frames->Clear();
+      if (rect) {
+        src->cuda_popup_x = rect->x; src->cuda_popup_y = rect->y;
+        src->cuda_popup_width = rect->width; src->cuda_popup_height = rect->height;
+      } else {
+        src->cuda_popup_visible = show;
+        src->cuda_popup_x = src->cuda_popup_y = src->cuda_popup_width = src->cuda_popup_height = 0;
+      }
+      // Retain desired state during flushing. The guarded UI resume task applies it.
+      if (src->cuda_pair_flushing || src->cuda_frames->ResumePending()) {
+        GST_OBJECT_UNLOCK(src); return;
+      }
+      std::string error;
+      gst_cef_src_apply_popup_locked(src, error);
+      if (!error.empty()) {
+        src->cuda_failed = TRUE;
+        g_cond_broadcast(&src->cuda_pair_cond);
+      }
+      GST_LOG_OBJECT(src, "Native popup: visible=%d rect=%d,%d %dx%d", src->cuda_popup_visible,
+          src->cuda_popup_x, src->cuda_popup_y, src->cuda_popup_width, src->cuda_popup_height);
+      GST_OBJECT_UNLOCK(src);
+      if (!error.empty()) GST_ELEMENT_ERROR(src, RESOURCE, FAILED,
+          ("CUDA popup update failed"), ("%s", error.c_str()));
+    }
+#endif
 
     GstCefSrc *src;
 
@@ -659,6 +828,9 @@ class BrowserClient :
       // Do NOT override with sizeof(CefWindowInfo) -- the C++ wrapper is larger
       // due to CefStructBase overhead, and CEF rejects mismatched sizes.
       window_info.SetAsWindowless(0);
+#ifdef GST_CEF_ENABLE_CUDA
+      window_info.shared_texture_enabled = src->cuda_memory;
+#endif
 
 #ifdef _WIN32
       if (src->gpu) {
@@ -756,12 +928,16 @@ void BrowserApp::OnScheduleMessagePumpWork(int64_t delay_ms)
 void BrowserApp::OnBeforeCommandLineProcessing(const CefString &process_type,
                                                CefRefPtr<CefCommandLine> command_line)
 {
+    command_line->AppendSwitch("no-first-run");
     command_line->AppendSwitchWithValue("autoplay-policy", "no-user-gesture-required");
     command_line->AppendSwitch("enable-media-stream");
     command_line->AppendSwitch("disable-dev-shm-usage"); /* https://github.com/GoogleChrome/puppeteer/issues/1834 */
     command_line->AppendSwitch("enable-begin-frame-scheduling"); /* https://bitbucket.org/chromiumembedded/cef/issues/1368 */
 
     bool gpu = src->gpu || (!!g_getenv ("GST_CEF_GPU_ENABLED"));
+#ifdef GST_CEF_ENABLE_CUDA
+    gpu = gpu || src->cuda_memory;
+#endif
 
 #ifdef __APPLE__
     command_line->AppendSwitch("off-screen-rendering-enabled");
@@ -839,17 +1015,77 @@ void BrowserApp::OnBeforeCommandLineProcessing(const CefString &process_type,
 
       g_strfreev (flags_list);
     }
+
+#ifdef GST_CEF_ENABLE_CUDA
+    // Apply after user flags, before the process-wide CEF initialization.
+    gst_cef_apply_cuda_startup_defaults(src->cuda_memory, *command_line);
+#endif
 }
 
 
 /** cefsrc (Gstreamer) methods */
 
+#ifdef GST_CEF_ENABLE_CUDA
+// Wait before borrowing the next completed publication. GstBaseSrc otherwise
+// selects in create(), then waits with that older frame already in flight.
+static GstFlowReturn gst_cef_src_wait_cuda_frame(GstCefSrc* src, GstClockTime* pts, bool* discont) {
+  for (;;) {
+    GST_OBJECT_LOCK(src);
+    if (src->cuda_pair_flushing || src->cuda_stopping) { GST_OBJECT_UNLOCK(src); return GST_FLOW_FLUSHING; }
+    if (src->cuda_failed) { GST_OBJECT_UNLOCK(src); return GST_FLOW_ERROR; }
+    const int fps_n = src->vinfo.fps_n, fps_d = src->vinfo.fps_d;
+    GST_OBJECT_UNLOCK(src);
+    GstClock* clock = gst_element_get_clock(GST_ELEMENT(src));
+    const GstClockTime base = gst_element_get_base_time(GST_ELEMENT(src));
+    const auto result = src->cuda_clock->Wait(clock, base, fps_n, fps_d, pts, discont);
+    GstClock* current_clock = gst_element_get_clock(GST_ELEMENT(src));
+    const bool changed = current_clock != clock || base != gst_element_get_base_time(GST_ELEMENT(src));
+    gst_clear_object(&current_clock);
+    gst_clear_object(&clock);
+    if (result == GpuFrameClock::Result::Cancelled) return GST_FLOW_FLUSHING;
+    if (result == GpuFrameClock::Result::Retry || changed) {
+      src->cuda_clock->Invalidate();
+      continue;
+    }
+    if (result == GpuFrameClock::Result::Ready) return GST_FLOW_OK;
+    GST_ELEMENT_ERROR(src, CORE, CLOCK, ("Cannot schedule a CUDA frame on the pipeline clock"), (nullptr));
+    return GST_FLOW_ERROR;
+  }
+}
+#endif
+
 static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
 {
   GstCefSrc *src = GST_CEF_SRC (push_src);
   GList *tmp;
+#ifdef GST_CEF_ENABLE_CUDA
+  GstClockTime cuda_pts = GST_CLOCK_TIME_NONE;
+  bool cuda_discont = false;
+  if (src->cuda_memory && !src->cuda_diagnostic_pairs) {
+    const GstFlowReturn result = gst_cef_src_wait_cuda_frame(src, &cuda_pts, &cuda_discont);
+    if (result != GST_FLOW_OK) return result;
+  }
+#endif
 
   GST_OBJECT_LOCK (src);
+
+#ifdef GST_CEF_ENABLE_CUDA
+  if (src->cuda_memory && src->cuda_pair_flushing) { GST_OBJECT_UNLOCK(src); return GST_FLOW_FLUSHING; }
+  if (src->cuda_diagnostic_pairs) {
+    *buf = nullptr;
+    const gint64 deadline = g_get_monotonic_time() + 30 * G_TIME_SPAN_SECOND;
+    while (!src->cuda_failed && !src->cuda_pair_flushing && !(*buf = src->cuda_pairs->Pop())) {
+      if (!g_cond_wait_until(&src->cuda_pair_cond, GST_OBJECT_GET_LOCK(src), deadline)) {
+        src->cuda_failed = TRUE;
+        GST_OBJECT_UNLOCK(src);
+        GST_ELEMENT_ERROR(src, RESOURCE, FAILED, ("Timed out waiting for a complete CUDA diagnostic pair"), (nullptr));
+        return GST_FLOW_ERROR;
+      }
+    }
+    if (src->cuda_pair_flushing) { GST_OBJECT_UNLOCK(src); return GST_FLOW_FLUSHING; }
+    if (src->cuda_failed) { GST_OBJECT_UNLOCK(src); return GST_FLOW_ERROR; }
+  }
+#endif
 
   if (src->audio_events) {
     for (tmp = src->audio_events; tmp; tmp = tmp->next) {
@@ -860,16 +1096,38 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
     src->audio_events = NULL;
   }
 
-  g_assert (src->current_buffer);
-  *buf = gst_buffer_copy (src->current_buffer);
+#ifdef GST_CEF_ENABLE_CUDA
+  if (src->cuda_failed) { GST_OBJECT_UNLOCK(src); return GST_FLOW_ERROR; }
+#endif
+#ifdef GST_CEF_ENABLE_CUDA
+  if (!src->cuda_diagnostic_pairs)
+#endif
+  {
+#ifdef GST_CEF_ENABLE_CUDA
+    if (src->cuda_memory) src->cuda_frames->Select(&src->current_buffer, &src->cuda_selected_sequence);
+#endif
+    g_assert (src->current_buffer);
+    *buf = gst_buffer_copy (src->current_buffer);
+  }
 
   if (src->audio_buffers) {
     gst_buffer_add_cef_audio_meta (*buf, src->audio_buffers);
     src->audio_buffers = NULL;
   }
 
+#ifdef GST_CEF_ENABLE_CUDA
+  if (GST_CLOCK_TIME_IS_VALID(cuda_pts)) {
+    GST_BUFFER_PTS(*buf) = GST_BUFFER_DTS(*buf) = cuda_pts;
+    if (cuda_discont) GST_BUFFER_FLAG_SET(*buf, GST_BUFFER_FLAG_DISCONT);
+  } else
+#endif
   GST_BUFFER_PTS (*buf) = gst_util_uint64_scale (src->n_frames, src->vinfo.fps_d * GST_SECOND, src->vinfo.fps_n);
   GST_BUFFER_DURATION (*buf) = gst_util_uint64_scale (GST_SECOND, src->vinfo.fps_d, src->vinfo.fps_n);
+#ifdef GST_CEF_ENABLE_CUDA
+  if (src->cuda_memory && !src->cuda_diagnostic_pairs)
+    GST_CAT_LOG_OBJECT(cef_cadence_debug, src, "cadence select seq=%" G_GUINT64_FORMAT " frame=%" G_GUINT64_FORMAT " pts_ns=%" G_GUINT64_FORMAT " monotonic_us=%" G_GINT64_FORMAT,
+        src->cuda_selected_sequence, src->n_frames, GST_BUFFER_PTS(*buf), g_get_monotonic_time());
+#endif
   src->n_frames++;
   GST_OBJECT_UNLOCK (src);
 
@@ -1122,6 +1380,21 @@ gst_cef_src_start(GstBaseSrc *base_src)
   gboolean ret = FALSE;
   GstCefSrc *src = GST_CEF_SRC (base_src);
 
+#ifdef GST_CEF_ENABLE_CUDA
+  if (src->cuda_diagnostic_pairs) {
+    gint num_buffers = -1;
+    g_object_get(src, "num-buffers", &num_buffers, nullptr);
+    if (num_buffers > 0 && num_buffers % 2 != 0) {
+      GST_ELEMENT_ERROR(src, RESOURCE, SETTINGS,
+          ("CUDA diagnostic pairs require an even num-buffers limit"), (nullptr));
+      return FALSE;
+    }
+    GST_WARNING_OBJECT(src, "CUDA paired-copy diagnostics enabled: delay=%u us; output is not a performance benchmark", src->cuda_pair_delay_us);
+  }
+  src->cuda_pair_flushing = FALSE;
+  src->cuda_stopping = FALSE;
+#endif
+
   GST_ELEMENT_PROGRESS(src, START, "open", ("Creating CEF browser client"));
 
   CefRefPtr<BrowserClient> browserClient = new BrowserClient(src);
@@ -1152,6 +1425,12 @@ gst_cef_src_start(GstBaseSrc *base_src)
 
   GST_OBJECT_LOCK (src);
   src->n_frames = 0;
+#ifdef GST_CEF_ENABLE_CUDA
+  src->cuda_clock->Reset();
+  src->cuda_frames->Clear();
+  src->cuda_frames->CancelResume();
+  src->cuda_selected_sequence = 0;
+#endif
   GST_OBJECT_UNLOCK (src);
 
   GST_ELEMENT_PROGRESS(src, CONTINUE, "open", ("Creating CEF browser ..."));
@@ -1217,6 +1496,15 @@ gst_cef_src_stop (GstBaseSrc *base_src)
 
   GST_INFO_OBJECT (src, "Stopping");
 
+#ifdef GST_CEF_ENABLE_CUDA
+  GST_OBJECT_LOCK(src);
+  src->cuda_stopping = TRUE;
+  src->cuda_clock->Cancel();
+  src->cuda_frames->CancelResume();
+  src->cuda_frames->Clear();
+  GST_OBJECT_UNLOCK(src);
+#endif
+
   if (src->browser) {
     gst_cef_src_close_browser(src);
 #ifdef __APPLE__
@@ -1232,7 +1520,17 @@ gst_cef_src_stop (GstBaseSrc *base_src)
 #endif
   }
 
+  GST_OBJECT_LOCK(src);
   gst_buffer_replace (&src->current_buffer, NULL);
+#ifdef GST_CEF_ENABLE_CUDA
+  if (src->cuda_pairs) src->cuda_pairs->Clear();
+  src->cuda_popup_visible = FALSE;
+  src->cuda_popup_x = src->cuda_popup_y = src->cuda_popup_width = src->cuda_popup_height = 0;
+  delete src->cuda_frame;
+  src->cuda_frame = nullptr;
+  src->cuda_failed = FALSE;
+#endif
+  GST_OBJECT_UNLOCK(src);
 
   return TRUE;
 }
@@ -1241,6 +1539,13 @@ static void
 gst_cef_src_get_times (GstBaseSrc * base_src, GstBuffer * buffer,
     GstClockTime * start, GstClockTime * end)
 {
+#ifdef GST_CEF_ENABLE_CUDA
+  GstCefSrc* src = GST_CEF_SRC(base_src);
+  if (src->cuda_memory && !src->cuda_diagnostic_pairs) {
+    *start = *end = GST_CLOCK_TIME_NONE;
+    return;
+  }
+#endif
   GstClockTime timestamp = GST_BUFFER_PTS (buffer);
   GstClockTime duration = GST_BUFFER_DURATION (buffer);
 
@@ -1257,6 +1562,11 @@ gst_cef_src_query (GstBaseSrc * base_src, GstQuery * query)
   GstCefSrc *src = GST_CEF_SRC (base_src);
 
   switch (GST_QUERY_TYPE (query)) {
+#ifdef GST_CEF_ENABLE_CUDA
+    case GST_QUERY_CONTEXT:
+      if (gst_cuda_handle_context_query(GST_ELEMENT(src), query, src->cuda_context)) return TRUE;
+      return GST_BASE_SRC_CLASS(parent_class)->query(base_src, query);
+#endif
     case GST_QUERY_LATENCY:
     {
       GstClockTime latency;
@@ -1276,6 +1586,92 @@ gst_cef_src_query (GstBaseSrc * base_src, GstQuery * query)
 
   return res;
 }
+
+#ifdef GST_CEF_ENABLE_CUDA
+static gboolean gst_cef_src_set_clock(GstElement* element, GstClock* clock) {
+  const gboolean accepted = GST_ELEMENT_CLASS(parent_class)->set_clock(element, clock);
+  GstCefSrc* src = GST_CEF_SRC(element);
+  if (accepted && src->cuda_memory && !src->cuda_diagnostic_pairs) src->cuda_clock->Invalidate();
+  return accepted;
+}
+
+static gboolean gst_cef_src_unlock(GstBaseSrc* base) {
+  GstCefSrc* src = GST_CEF_SRC(base);
+  if (!src->cuda_memory) return TRUE;
+  GST_OBJECT_LOCK(src);
+  src->cuda_pair_flushing = TRUE;
+  src->cuda_clock->Cancel();
+  if (!src->cuda_diagnostic_pairs) src->cuda_frames->BeginFlush();
+  else src->cuda_frames->Clear();
+  if (src->cuda_pairs) src->cuda_pairs->Clear();
+  g_cond_broadcast(&src->cuda_pair_cond);
+  GST_OBJECT_UNLOCK(src);
+  return TRUE;
+}
+
+static gboolean gst_cef_src_unlock_stop(GstBaseSrc* base) {
+  GstCefSrc* src = GST_CEF_SRC(base);
+  if (!src->cuda_memory) return TRUE;
+  g_mutex_lock(&src->state_lock);
+  CefRefPtr<CefBrowser> browser = src->browser;
+  g_mutex_unlock(&src->state_lock);
+  GST_OBJECT_LOCK(src);
+  src->cuda_pair_flushing = FALSE;
+  src->cuda_clock->Resume();
+  const guint64 generation = src->cuda_frames->ResumeGeneration();
+  const bool refresh = !src->cuda_diagnostic_pairs && browser && !src->cuda_stopping &&
+      src->cuda_frames->ResumePending();
+  if (!browser) src->cuda_frames->CancelResume();
+  GST_OBJECT_UNLOCK(src);
+  if (refresh) {
+    // Retain both objects until the task completes or CEF rejects the task.
+    auto retained = std::shared_ptr<GstCefSrc>(GST_CEF_SRC(gst_object_ref(src)),
+        [](GstCefSrc* source) { gst_object_unref(source); });
+    if (!CefPostTask(TID_UI, base::BindOnce([](std::shared_ptr<GstCefSrc> retained, CefRefPtr<CefBrowser> browser, guint64 generation) {
+      GstCefSrc* source = retained.get();
+      GST_OBJECT_LOCK(source);
+      if (source->browser != browser || source->cuda_failed ||
+          !source->cuda_frames->CanResume(generation, source->cuda_pair_flushing, source->cuda_stopping)) {
+        GST_OBJECT_UNLOCK(source); return;
+      }
+      std::string error;
+      gst_cef_src_apply_popup_locked(source, error);
+      source->cuda_frames->FinishResume();
+      const bool popup_visible = source->cuda_popup_visible;
+      if (!error.empty()) source->cuda_failed = TRUE;
+      GST_OBJECT_UNLOCK(source);
+      if (!error.empty()) {
+        GST_ELEMENT_ERROR(source, RESOURCE, FAILED, ("CUDA popup resume failed"), ("%s", error.c_str()));
+        return;
+      }
+      browser->GetHost()->Invalidate(PET_VIEW);
+      if (popup_visible) browser->GetHost()->Invalidate(PET_POPUP);
+    }, retained, browser, generation))) {
+      GST_ELEMENT_ERROR(src, RESOURCE, FAILED, ("Cannot schedule CUDA browser resume"), (nullptr));
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+static void gst_cef_src_set_context(GstElement* element, GstContext* context) {
+  GstCefSrc* src = GST_CEF_SRC(element);
+  GST_OBJECT_LOCK(src);
+  gst_cuda_handle_set_context(element, context, -1, &src->cuda_context);
+  GST_OBJECT_UNLOCK(src);
+  GST_ELEMENT_CLASS(parent_class)->set_context(element, context);
+}
+
+static GstCaps* gst_cef_src_get_caps(GstBaseSrc* base, GstCaps* filter) {
+  GstCefSrc* src = GST_CEF_SRC(base);
+  GstCaps* caps = gst_caps_from_string(src->cuda_memory ? CEF_CUDA_VIDEO_CAPS : CEF_SYSTEM_VIDEO_CAPS);
+  if (filter) {
+    GstCaps* result = gst_caps_intersect_full(filter, caps, GST_CAPS_INTERSECT_FIRST);
+    gst_caps_unref(caps); return result;
+  }
+  return caps;
+}
+#endif
 
 static GstCaps *
 gst_cef_src_fixate (GstBaseSrc * base_src, GstCaps * caps)
@@ -1310,9 +1706,51 @@ gst_cef_src_set_caps (GstBaseSrc * base_src, GstCaps * caps)
 
   GST_INFO_OBJECT (base_src, "Caps set to %" GST_PTR_FORMAT, caps);
 
+  GstVideoInfo negotiated;
+  if (!gst_video_info_from_caps(&negotiated, caps)) return FALSE;
+#ifdef GST_CEF_ENABLE_CUDA
+  bool cuda_caps = gst_caps_features_contains(gst_caps_get_features(caps, 0), GST_CAPS_FEATURE_MEMORY_CUDA_MEMORY);
+  if (cuda_caps != bool(src->cuda_memory)) {
+    GST_ERROR_OBJECT(src, "negotiated caps must carry memory:CUDAMemory"); return FALSE;
+  }
+  // Context discovery can call set_context; do not hold the object lock here.
+  if (cuda_caps && (!gst_cuda_load_library() ||
+      !gst_cuda_ensure_element_context(GST_ELEMENT(src), -1, &src->cuda_context))) return FALSE;
+#endif
   GST_OBJECT_LOCK (src);
-  gst_video_info_from_caps (&src->vinfo, caps);
-  new_buffer = gst_buffer_new_allocate (NULL, src->vinfo.width * src->vinfo.height * 4, NULL);
+  src->vinfo = negotiated;
+#ifdef GST_CEF_ENABLE_CUDA
+  if (cuda_caps) {
+    if (src->cuda_diagnostic_pairs) {
+      if (src->n_frames != 0) {
+        GST_OBJECT_UNLOCK(src);
+        GST_ELEMENT_ERROR(src, RESOURCE, SETTINGS, ("Paired diagnostics do not support mid-capture caps changes"), (nullptr));
+        return FALSE;
+      }
+      if (!src->cuda_pairs) src->cuda_pairs = new GpuPairQueue();
+      src->cuda_pairs->Clear();
+    }
+    src->cuda_frames->Reset(&src->current_buffer, &src->cuda_selected_sequence, nullptr, 0);
+    delete src->cuda_frame;
+    src->cuda_frame = new LinuxCudaFrame(src->cuda_context, src->vinfo, caps);
+    std::string error;
+    if (src->cuda_popup_visible) {
+      CefRect bounds(src->cuda_popup_x, src->cuda_popup_y, src->cuda_popup_width, src->cuda_popup_height);
+      src->cuda_frame->UpdatePopup(true, bounds, error);
+    }
+    new_buffer = src->cuda_frame->Blank(error);
+    src->cuda_failed = !new_buffer;
+    if (!new_buffer) {
+      GST_OBJECT_UNLOCK(src);
+      GST_ELEMENT_ERROR(src, RESOURCE, FAILED, ("Cannot configure CUDA browser output"), ("%s", error.c_str()));
+      return FALSE;
+    }
+  } else
+#endif
+  {
+    new_buffer = gst_buffer_new_allocate (NULL, src->vinfo.size, NULL);
+    gst_buffer_memset(new_buffer, 0, 0, src->vinfo.size);
+  }
   gst_buffer_replace (&(src->current_buffer), new_buffer);
   gst_buffer_unref (new_buffer);
   if (src->browser) {
@@ -1374,6 +1812,16 @@ gst_cef_src_set_property (GObject * object, guint prop_id, const GValue * value,
       src->chrome_extra_flags = g_value_dup_string (value);
       break;
     }
+#ifdef GST_CEF_ENABLE_CUDA
+    case PROP_CUDA_DIAGNOSTIC_PAIRS:
+    case PROP_CUDA_PAIR_DELAY_US:
+      if (GST_STATE(src) != GST_STATE_NULL) {
+        GST_WARNING_OBJECT(src, "CUDA diagnostics can only change in NULL state"); break;
+      }
+      if (prop_id == PROP_CUDA_DIAGNOSTIC_PAIRS) src->cuda_diagnostic_pairs = g_value_get_boolean(value);
+      else src->cuda_pair_delay_us = g_value_get_uint(value);
+      break;
+#endif
     case PROP_GPU:
     {
       GST_WARNING_OBJECT(
@@ -1463,6 +1911,14 @@ gst_cef_src_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_CHROME_EXTRA_FLAGS:
       g_value_set_string (value, src->chrome_extra_flags);
       break;
+#ifdef GST_CEF_ENABLE_CUDA
+    case PROP_CUDA_DIAGNOSTIC_PAIRS:
+      g_value_set_boolean(value, src->cuda_diagnostic_pairs);
+      break;
+    case PROP_CUDA_PAIR_DELAY_US:
+      g_value_set_uint(value, src->cuda_pair_delay_us);
+      break;
+#endif
     case PROP_GPU:
       g_value_set_boolean (value, src->gpu);
       break;
@@ -1505,6 +1961,19 @@ gst_cef_src_finalize (GObject *object)
   }
 #endif
 
+#ifdef GST_CEF_ENABLE_CUDA
+  gst_buffer_replace(&src->current_buffer, nullptr);
+  delete src->cuda_pairs;
+  src->cuda_pairs = nullptr;
+  delete src->cuda_frames;
+  src->cuda_frames = nullptr;
+  delete src->cuda_clock;
+  src->cuda_clock = nullptr;
+  delete src->cuda_frame;
+  src->cuda_frame = nullptr;
+  gst_clear_object(&src->cuda_context);
+  g_cond_clear(&src->cuda_pair_cond);
+#endif
   if (src->audio_buffers) {
     gst_buffer_list_unref (src->audio_buffers);
     src->audio_buffers = NULL;
@@ -1526,6 +1995,25 @@ gst_cef_src_init (GstCefSrc * src)
   GstBaseSrc *base_src = GST_BASE_SRC (src);
 
   src->n_frames = 0;
+#ifdef GST_CEF_ENABLE_CUDA
+  // CUDA builds always deliver owned CUDA frames. There is no system-memory path.
+  src->cuda_memory = TRUE;
+  src->cuda_publish_sequence = 0;
+  src->cuda_selected_sequence = 0;
+  src->cuda_frames = new GpuFrameQueue();
+  src->cuda_clock = new GpuFrameClock();
+  src->cuda_failed = FALSE;
+  src->cuda_stopping = FALSE;
+  src->cuda_popup_visible = FALSE;
+  src->cuda_popup_x = src->cuda_popup_y = src->cuda_popup_width = src->cuda_popup_height = 0;
+  src->cuda_diagnostic_pairs = FALSE;
+  src->cuda_pair_flushing = FALSE;
+  src->cuda_pair_delay_us = 1000;
+  src->cuda_pairs = nullptr;
+  g_cond_init(&src->cuda_pair_cond);
+  src->cuda_context = nullptr;
+  src->cuda_frame = nullptr;
+#endif
   src->current_buffer = NULL;
   src->audio_buffers = NULL;
   src->audio_events = NULL;
@@ -1569,6 +2057,22 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
       g_param_spec_string ("url", "url",
           "The URL to display",
           DEFAULT_URL, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT)));
+
+#ifdef GST_CEF_ENABLE_CUDA
+  g_object_class_install_property(gobject_class, PROP_CUDA_DIAGNOSTIC_PAIRS,
+      g_param_spec_boolean("cuda-diagnostic-pairs", "CUDA diagnostic pairs",
+          "Test only: emit two independent copies per sampled callback; excludes synthetic repeats and startup blank frames",
+          FALSE, GParamFlags(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  g_object_class_install_property(gobject_class, PROP_CUDA_PAIR_DELAY_US,
+      g_param_spec_uint("cuda-pair-delay-us", "CUDA pair delay",
+          "Test only: hold the CEF callback between diagnostic copies, in microseconds",
+          0, 100000, 1000, GParamFlags(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
+  gstelement_class->set_clock = GST_DEBUG_FUNCPTR(gst_cef_src_set_clock);
+  base_src_class->unlock = GST_DEBUG_FUNCPTR(gst_cef_src_unlock);
+  base_src_class->unlock_stop = GST_DEBUG_FUNCPTR(gst_cef_src_unlock_stop);
+  gstelement_class->set_context = GST_DEBUG_FUNCPTR(gst_cef_src_set_context);
+  base_src_class->get_caps = GST_DEBUG_FUNCPTR(gst_cef_src_get_caps);
+#endif
 
   g_object_class_install_property (gobject_class, PROP_GPU,
     g_param_spec_boolean ("gpu", "gpu",
@@ -1652,6 +2156,10 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
 
   GST_DEBUG_CATEGORY_INIT (cef_src_debug, "cefsrc", 0,
       "Chromium Embedded Framework Source");
+#ifdef GST_CEF_ENABLE_CUDA
+  GST_DEBUG_CATEGORY_INIT (cef_cadence_debug, "cefcadence", 0,
+      "CUDA browser publication and selection timing");
+#endif
   GST_DEBUG_CATEGORY_INIT (cef_console_debug, "cefconsole", 0,
       "Chromium Embedded Framework JS Console");
 }
