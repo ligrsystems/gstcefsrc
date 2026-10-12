@@ -1692,6 +1692,14 @@ gst_cef_src_set_caps (GstBaseSrc * base_src, GstCaps * caps)
           src->paint_rate, fps);
       fps = src->paint_rate;
     }
+    /* In frame-tag mode the page draws one queued data frame per animation
+     * frame. At exactly the stream rate a backlog (start-up, a slow frame)
+     * never drains, so let the browser run faster; CEF clamps the rate. */
+    if (src->frame_tag) {
+      GST_INFO_OBJECT (src, "Frame tags: browser frame rate %d (stream fps %d)",
+          fps * 2, fps);
+      fps *= 2;
+    }
     CefPostTask (TID_UI,
         base::BindOnce ([](CefRefPtr<CefBrowser> b, int rate) {
           CEF_REQUIRE_UI_THREAD();
