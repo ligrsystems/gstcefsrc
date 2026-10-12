@@ -64,8 +64,45 @@ GST_DEBUG_CATEGORY_STATIC (cef_lock_debug);
 #define DEFAULT_FRAME_LOCK_LATENCY (100 * GST_MSECOND)
 #define DEFAULT_FRAME_LOCK_TIMEOUT (40 * GST_MSECOND)
 /* Requests beyond this depth mean the browser cannot keep up; the oldest
- * request is dropped so rendering stays close to the newest video frame. */
-#define FRAME_LOCK_MAX_PENDING 8
+ * request is dropped. Video reaches the tap in bursts of about 20 frames,
+ * so the queue holds several bursts. */
+#define FRAME_LOCK_MAX_PENDING 64
+/* Interval between BeginFrame re-sends while a locked frame waits for paint. */
+#define FRAME_LOCK_RESEND_US 2000
+#define FRAME_TAG_RING 16
+#define FRAME_TAG_PIXELS 9
+#define FRAME_TAG_MASK 0xffffff
+
+typedef struct {
+  GstClockTime running_time;
+  gint64 tag; /* -1 for an untagged (frame-lock) request */
+} CefFrameRequest;
+
+/* Reads the frame tag from the bottom-right FRAME_TAG_PIXELS of a BGRA frame:
+ * a magenta marker, then 8 pixels holding 3 bits each in R, G, B (MSB first
+ * per pixel), least significant pixel first. Returns -1 when absent. */
+static gint64
+gst_cef_read_frame_tag (const guint8 *bgra, int w, int h)
+{
+  if (w < FRAME_TAG_PIXELS || h < 1)
+    return -1;
+  const guint8 *row = bgra + ((gsize) (h - 1) * w + (w - FRAME_TAG_PIXELS)) * 4;
+  if (row[0] < 200 || row[1] > 55 || row[2] < 200 || row[3] < 200)
+    return -1;
+  gint64 tag = 0;
+  for (int j = 0; j < 8; j++) {
+    const guint8 *px = row + (1 + j) * 4;
+    gint64 bits = ((px[2] >= 128) << 2) | ((px[1] >= 128) << 1) | (px[0] >= 128);
+    tag |= bits << (3 * j);
+  }
+  return tag;
+}
+
+static gboolean
+gst_cef_tag_not_before (gint64 a, gint64 b)
+{
+  return ((a - b) & FRAME_TAG_MASK) < 0x800000;
+}
 
 using CefStatus = enum : guint8 {
   // CEF was either unloaded successfully or not yet loaded.
@@ -154,11 +191,13 @@ enum
   PROP_FRAME_LOCK,
   PROP_FRAME_LOCK_LATENCY,
   PROP_FRAME_LOCK_TIMEOUT,
+  PROP_FRAME_TAG,
 };
 
 enum
 {
   SIGNAL_REQUEST_FRAME,
+  SIGNAL_REQUEST_TAGGED_FRAME,
   LAST_SIGNAL,
 };
 
@@ -303,9 +342,50 @@ class RenderHandler : public CefRenderHandler
       if (copy_size < target_size)
         gst_buffer_memset (new_buffer, copy_size, 0, target_size - copy_size);
 
+      gint64 tag = -1;
+      if (src->frame_tag && type == PET_VIEW && (guint) w == target_width && (guint) h == target_height) {
+        tag = gst_cef_read_frame_tag ((const guint8 *) buffer, w, h);
+        if (tag >= 0) {
+          /* The tag is not part of the picture: make it transparent. */
+          gst_buffer_memset (new_buffer,
+              ((gsize) (h - 1) * w + (w - FRAME_TAG_PIXELS)) * 4, 0, FRAME_TAG_PIXELS * 4);
+        }
+      }
+
       GST_OBJECT_LOCK (src);
       gst_buffer_replace (&(src->current_buffer), new_buffer);
+      if (src->frame_tag && type == PET_VIEW) {
+        if (tag < 0) {
+          src->ft_untagged++;
+        } else {
+          guint slot;
+          if (src->tag_count < FRAME_TAG_RING) {
+            slot = src->tag_count++;
+          } else {
+            gst_buffer_unref (src->tag_bufs[0]);
+            memmove (&src->tag_bufs[0], &src->tag_bufs[1], sizeof (GstBuffer *) * (FRAME_TAG_RING - 1));
+            memmove (&src->tag_ids[0], &src->tag_ids[1], sizeof (gint64) * (FRAME_TAG_RING - 1));
+            slot = FRAME_TAG_RING - 1;
+          }
+          src->tag_bufs[slot] = gst_buffer_ref (new_buffer);
+          src->tag_ids[slot] = tag;
+          src->paint_seq++;
+          g_cond_broadcast (&src->frame_cond);
+        }
+      }
       gst_buffer_unref (new_buffer);
+      if (type == PET_VIEW) {
+        /* Paint rate, logged once a second (ceflock INFO). */
+        gint64 now = g_get_monotonic_time ();
+        src->fl_paints_window++;
+        if (now - src->fl_paints_window_start >= G_USEC_PER_SEC) {
+          if (src->fl_paints_window_start)
+            GST_CAT_INFO_OBJECT (cef_lock_debug, src, "paints/s %.1f",
+                src->fl_paints_window * (gdouble) G_USEC_PER_SEC / (now - src->fl_paints_window_start));
+          src->fl_paints_window = 0;
+          src->fl_paints_window_start = now;
+        }
+      }
       if (src->frame_lock && type == PET_VIEW) {
         src->paint_seq++;
         if (src->fl_begin_frame_at) {
@@ -902,7 +982,7 @@ static GstClockTime
 gst_cef_src_wait_locked_frame (GstCefSrc *src)
 {
   GMutex *lock = GST_OBJECT_GET_LOCK (src);
-  GstClockTime *req;
+  CefFrameRequest *req;
   GstClockTime running_time;
   guint64 seq;
   gint64 deadline;
@@ -912,19 +992,25 @@ gst_cef_src_wait_locked_frame (GstCefSrc *src)
   if (src->flushing)
     return GST_CLOCK_TIME_NONE;
 
-  req = (GstClockTime *) g_queue_pop_head (src->frame_requests);
-  running_time = *req;
+  req = (CefFrameRequest *) g_queue_pop_head (src->frame_requests);
+  running_time = req->running_time;
   g_free (req);
 
   seq = src->paint_seq;
   src->fl_begin_frame_at = g_get_monotonic_time ();
-  if (src->browser)
-    CefPostTask (TID_UI, base::BindOnce (&gst_cef_send_begin_frame_on_ui_thread, src->browser));
-
   deadline = src->fl_begin_frame_at + (gint64) (src->frame_lock_timeout / GST_USECOND);
+
+  /* CEF ignores SendExternalBeginFrame while the previous BeginFrame has not
+   * completed (begin_frame_pending_), and that completion can arrive after
+   * the previous paint. Re-send until this frame paints; a re-send that CEF
+   * ignores has no effect. */
   while (src->paint_seq == seq && !src->flushing) {
-    if (!g_cond_wait_until (&src->frame_cond, lock, deadline))
+    gint64 now = g_get_monotonic_time ();
+    if (now >= deadline)
       break;
+    if (src->browser)
+      CefPostTask (TID_UI, base::BindOnce (&gst_cef_send_begin_frame_on_ui_thread, src->browser));
+    g_cond_wait_until (&src->frame_cond, lock, MIN (now + FRAME_LOCK_RESEND_US, deadline));
   }
   if (src->flushing)
     return GST_CLOCK_TIME_NONE;
@@ -953,11 +1039,84 @@ gst_cef_src_wait_locked_frame (GstCefSrc *src)
   return running_time;
 }
 
-static void
-gst_cef_src_request_frame (GstCefSrc *src, guint64 running_time)
+/* Called with the object lock held. Waits for a tagged request and for the
+ * paint carrying its tag. Sets *out to a new ref of the chosen paint (or NULL
+ * when none exists yet). Returns the requested running time, or
+ * GST_CLOCK_TIME_NONE when flushing. */
+static GstClockTime
+gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out)
 {
-  GstClockTime *req = g_new (GstClockTime, 1);
-  *req = running_time;
+  GMutex *lock = GST_OBJECT_GET_LOCK (src);
+  CefFrameRequest *req;
+  GstClockTime running_time;
+  gint64 want;
+  gint64 deadline;
+
+  *out = NULL;
+  while (g_queue_is_empty (src->frame_requests) && !src->flushing)
+    g_cond_wait (&src->frame_cond, lock);
+  if (src->flushing)
+    return GST_CLOCK_TIME_NONE;
+
+  req = (CefFrameRequest *) g_queue_pop_head (src->frame_requests);
+  running_time = req->running_time;
+  want = req->tag & FRAME_TAG_MASK;
+  g_free (req);
+
+  /* Wait until a paint at or after the wanted tag exists. */
+  deadline = g_get_monotonic_time () + (gint64) (src->frame_lock_timeout / GST_USECOND);
+  while (!src->flushing) {
+    if (src->tag_count > 0 && gst_cef_tag_not_before (src->tag_ids[src->tag_count - 1], want))
+      break;
+    if (!g_cond_wait_until (&src->frame_cond, lock, deadline))
+      break;
+  }
+  if (src->flushing)
+    return GST_CLOCK_TIME_NONE;
+
+  /* Exact paint, else the newest paint before it (a repeat). */
+  gint best = -1;
+  for (gint i = src->tag_count - 1; i >= 0; i--) {
+    if (src->tag_ids[i] == want) {
+      best = i;
+      src->ft_exact++;
+      break;
+    }
+  }
+  if (best < 0) {
+    for (gint i = src->tag_count - 1; i >= 0; i--) {
+      if (!gst_cef_tag_not_before (src->tag_ids[i], want + 1)) {
+        best = i;
+        src->ft_stale++;
+        break;
+      }
+    }
+  }
+  if (best < 0 && src->tag_count > 0) {
+    best = 0;
+    src->ft_ahead++;
+  }
+  if (best >= 0)
+    *out = gst_buffer_ref (src->tag_bufs[best]);
+
+  src->fl_frames++;
+  if (src->fl_frames % 250 == 0) {
+    GST_CAT_INFO_OBJECT (cef_lock_debug, src,
+        "tagged frames %" G_GUINT64_FORMAT " exact %" G_GUINT64_FORMAT " stale %" G_GUINT64_FORMAT
+        " ahead %" G_GUINT64_FORMAT " untagged paints %" G_GUINT64_FORMAT
+        " dropped requests %" G_GUINT64_FORMAT,
+        src->fl_frames, src->ft_exact, src->ft_stale, src->ft_ahead, src->ft_untagged,
+        src->fl_dropped_requests);
+  }
+  return running_time;
+}
+
+static void
+gst_cef_src_queue_request (GstCefSrc *src, guint64 running_time, gint64 tag)
+{
+  CefFrameRequest *req = g_new (CefFrameRequest, 1);
+  req->running_time = running_time;
+  req->tag = tag;
 
   GST_OBJECT_LOCK (src);
   if (g_queue_get_length (src->frame_requests) >= FRAME_LOCK_MAX_PENDING) {
@@ -969,15 +1128,34 @@ gst_cef_src_request_frame (GstCefSrc *src, guint64 running_time)
   GST_OBJECT_UNLOCK (src);
 }
 
+static void
+gst_cef_src_request_frame (GstCefSrc *src, guint64 running_time)
+{
+  gst_cef_src_queue_request (src, running_time, -1);
+}
+
+static void
+gst_cef_src_request_tagged_frame (GstCefSrc *src, guint64 running_time, guint tag)
+{
+  gst_cef_src_queue_request (src, running_time, tag);
+}
+
 static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
 {
   GstCefSrc *src = GST_CEF_SRC (push_src);
   GList *tmp;
   GstClockTime locked_rt = GST_CLOCK_TIME_NONE;
+  GstBuffer *tagged = NULL;
 
   GST_OBJECT_LOCK (src);
 
-  if (src->frame_lock) {
+  if (src->frame_tag) {
+    locked_rt = gst_cef_src_wait_tagged_frame (src, &tagged);
+    if (!GST_CLOCK_TIME_IS_VALID (locked_rt)) {
+      GST_OBJECT_UNLOCK (src);
+      return GST_FLOW_FLUSHING;
+    }
+  } else if (src->frame_lock) {
     locked_rt = gst_cef_src_wait_locked_frame (src);
     if (!GST_CLOCK_TIME_IS_VALID (locked_rt)) {
       GST_OBJECT_UNLOCK (src);
@@ -995,14 +1173,19 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
   }
 
   g_assert (src->current_buffer);
-  *buf = gst_buffer_copy (src->current_buffer);
+  if (tagged) {
+    *buf = gst_buffer_copy (tagged);
+    gst_buffer_unref (tagged);
+  } else {
+    *buf = gst_buffer_copy (src->current_buffer);
+  }
 
   if (src->audio_buffers) {
     gst_buffer_add_cef_audio_meta (*buf, src->audio_buffers);
     src->audio_buffers = NULL;
   }
 
-  if (src->frame_lock) {
+  if (src->frame_lock || src->frame_tag) {
     GST_BUFFER_PTS (*buf) = locked_rt;
     GST_BUFFER_DTS (*buf) = locked_rt;
   } else {
@@ -1295,6 +1478,7 @@ gst_cef_src_start(GstBaseSrc *base_src)
   src->paint_seq = 0;
   src->fl_frames = src->fl_timeouts = src->fl_dropped_requests = 0;
   src->fl_paint_us_sum = src->fl_paint_us_max = src->fl_begin_frame_at = 0;
+  src->ft_exact = src->ft_stale = src->ft_ahead = src->ft_untagged = 0;
   GST_OBJECT_UNLOCK (src);
 
   GST_ELEMENT_PROGRESS(src, CONTINUE, "open", ("Creating CEF browser ..."));
@@ -1379,6 +1563,9 @@ gst_cef_src_stop (GstBaseSrc *base_src)
 
   GST_OBJECT_LOCK (src);
   g_queue_clear_full (src->frame_requests, g_free);
+  for (guint i = 0; i < src->tag_count; i++)
+    gst_buffer_unref (src->tag_bufs[i]);
+  src->tag_count = 0;
   GST_OBJECT_UNLOCK (src);
 
   return TRUE;
@@ -1416,7 +1603,7 @@ gst_cef_src_get_times (GstBaseSrc * base_src, GstBuffer * buffer,
 
   /* A locked frame is produced after its running time has passed; the
    * downstream aggregator waits for it within the reported latency. */
-  if (GST_CEF_SRC (base_src)->frame_lock) {
+  if (GST_CEF_SRC (base_src)->frame_lock || GST_CEF_SRC (base_src)->frame_tag) {
     *start = *end = GST_CLOCK_TIME_NONE;
     return;
   }
@@ -1438,7 +1625,7 @@ gst_cef_src_query (GstBaseSrc * base_src, GstQuery * query)
     {
       GstClockTime latency;
 
-      if (src->frame_lock) {
+      if (src->frame_lock || src->frame_tag) {
         GST_DEBUG_OBJECT (src, "Reporting frame-lock latency: %" GST_TIME_FORMAT,
             GST_TIME_ARGS (src->frame_lock_latency));
         gst_query_set_latency (query, TRUE, src->frame_lock_latency, GST_CLOCK_TIME_NONE);
@@ -1499,7 +1686,8 @@ gst_cef_src_set_caps (GstBaseSrc * base_src, GstCaps * caps)
   if (src->browser) {
     CefRefPtr<CefBrowser> browser = src->browser;
     int fps = (int)gst_util_uint64_scale (1, src->vinfo.fps_n, src->vinfo.fps_d);
-    if (src->paint_rate > 0 && src->paint_rate < fps) {
+    /* In frame-lock mode the pipeline's requests set the paint rate. */
+    if (!src->frame_lock && !src->frame_tag && src->paint_rate > 0 && src->paint_rate < fps) {
       GST_INFO_OBJECT (src, "Capping browser paint rate to %d (stream fps %d)",
           src->paint_rate, fps);
       fps = src->paint_rate;
@@ -1587,6 +1775,9 @@ gst_cef_src_set_property (GObject * object, guint prop_id, const GValue * value,
     case PROP_FRAME_LOCK_TIMEOUT:
       src->frame_lock_timeout = g_value_get_uint64 (value);
       break;
+    case PROP_FRAME_TAG:
+      src->frame_tag = g_value_get_boolean (value);
+      break;
     case PROP_SANDBOX:
     {
       GST_WARNING_OBJECT(
@@ -1671,6 +1862,9 @@ gst_cef_src_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_FRAME_LOCK_TIMEOUT:
       g_value_set_uint64 (value, src->frame_lock_timeout);
       break;
+    case PROP_FRAME_TAG:
+      g_value_set_boolean (value, src->frame_tag);
+      break;
     case PROP_SANDBOX:
       g_value_set_boolean (value, src->sandbox);
       break;
@@ -1751,6 +1945,8 @@ gst_cef_src_init (GstCefSrc * src)
   src->frame_lock_latency = DEFAULT_FRAME_LOCK_LATENCY;
   src->frame_lock_timeout = DEFAULT_FRAME_LOCK_TIMEOUT;
   src->frame_requests = g_queue_new ();
+  src->frame_tag = FALSE;
+  src->tag_count = 0;
   g_cond_init (&src->frame_cond);
   src->paint_seq = 0;
   src->flushing = FALSE;
@@ -1860,6 +2056,28 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
           "frame is repeated",
           0, G_MAXUINT64, DEFAULT_FRAME_LOCK_TIMEOUT,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_PLAYING)));
+
+  g_object_class_install_property (gobject_class, PROP_FRAME_TAG,
+    g_param_spec_boolean ("frame-tag", "frame-tag",
+          "The page stamps each paint with a frame tag (9 px, bottom-right); "
+          "each request-tagged-frame call outputs the paint with that tag, "
+          "stamped with the requested running time. The browser paints freely.",
+          FALSE,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
+
+  /**
+   * GstCefSrc::request-tagged-frame:
+   * @src: the cefsrc
+   * @running_time: running time (ns) of the video frame
+   * @tag: 24-bit tag the page draws with that frame's data
+   *
+   * Frame-tag mode only.
+   */
+  gst_cef_src_signals[SIGNAL_REQUEST_TAGGED_FRAME] =
+      g_signal_new_class_handler ("request-tagged-frame", G_TYPE_FROM_CLASS (klass),
+      (GSignalFlags) (G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION),
+      G_CALLBACK (gst_cef_src_request_tagged_frame), NULL, NULL, NULL,
+      G_TYPE_NONE, 2, G_TYPE_UINT64, G_TYPE_UINT);
 
   /**
    * GstCefSrc::request-frame:
