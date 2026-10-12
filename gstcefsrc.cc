@@ -44,6 +44,8 @@ GST_DEBUG_CATEGORY_STATIC (cef_src_debug);
 
 GST_DEBUG_CATEGORY_STATIC (cef_console_debug);
 
+GST_DEBUG_CATEGORY_STATIC (cef_lock_debug);
+
 #define DEFAULT_WIDTH 1920
 #define DEFAULT_HEIGHT 1080
 #define DEFAULT_FPS_N 30
@@ -58,6 +60,12 @@ GST_DEBUG_CATEGORY_STATIC (cef_console_debug);
 #define DEFAULT_SANDBOX FALSE
 #endif
 #define DEFAULT_LISTEN_FOR_JS_SIGNALS FALSE
+#define DEFAULT_FRAME_LOCK FALSE
+#define DEFAULT_FRAME_LOCK_LATENCY (100 * GST_MSECOND)
+#define DEFAULT_FRAME_LOCK_TIMEOUT (40 * GST_MSECOND)
+/* Requests beyond this depth mean the browser cannot keep up; the oldest
+ * request is dropped so rendering stays close to the newest video frame. */
+#define FRAME_LOCK_MAX_PENDING 8
 
 using CefStatus = enum : guint8 {
   // CEF was either unloaded successfully or not yet loaded.
@@ -143,7 +151,18 @@ enum
   PROP_JS_FLAGS,
   PROP_LOG_SEVERITY,
   PROP_CEF_CACHE_LOCATION,
+  PROP_FRAME_LOCK,
+  PROP_FRAME_LOCK_LATENCY,
+  PROP_FRAME_LOCK_TIMEOUT,
 };
+
+enum
+{
+  SIGNAL_REQUEST_FRAME,
+  LAST_SIGNAL,
+};
+
+static guint gst_cef_src_signals[LAST_SIGNAL] = { 0 };
 
 #define gst_cef_src_parent_class parent_class
 G_DEFINE_TYPE (GstCefSrc, gst_cef_src, GST_TYPE_PUSH_SRC);
@@ -287,6 +306,17 @@ class RenderHandler : public CefRenderHandler
       GST_OBJECT_LOCK (src);
       gst_buffer_replace (&(src->current_buffer), new_buffer);
       gst_buffer_unref (new_buffer);
+      if (src->frame_lock && type == PET_VIEW) {
+        src->paint_seq++;
+        if (src->fl_begin_frame_at) {
+          gint64 us = g_get_monotonic_time () - src->fl_begin_frame_at;
+          src->fl_paint_us_sum += us;
+          if (us > src->fl_paint_us_max)
+            src->fl_paint_us_max = us;
+          src->fl_begin_frame_at = 0;
+        }
+        g_cond_broadcast (&src->frame_cond);
+      }
       GST_OBJECT_UNLOCK (src);
 
       GST_LOG_OBJECT (src, "done painting");
@@ -659,6 +689,9 @@ class BrowserClient :
       // Do NOT override with sizeof(CefWindowInfo) -- the C++ wrapper is larger
       // due to CefStructBase overhead, and CEF rejects mismatched sizes.
       window_info.SetAsWindowless(0);
+      window_info.external_begin_frame_enabled = src->frame_lock;
+      if (src->frame_lock)
+        GST_INFO_OBJECT(src, "Frame lock: external BeginFrame enabled");
 
 #ifdef _WIN32
       if (src->gpu) {
@@ -760,6 +793,16 @@ void BrowserApp::OnBeforeCommandLineProcessing(const CefString &process_type,
     command_line->AppendSwitch("enable-media-stream");
     command_line->AppendSwitch("disable-dev-shm-usage"); /* https://github.com/GoogleChrome/puppeteer/issues/1834 */
     command_line->AppendSwitch("enable-begin-frame-scheduling"); /* https://bitbucket.org/chromiumembedded/cef/issues/1368 */
+    if (src->frame_lock) {
+      /* Make each external BeginFrame run main frame, commit, raster and draw
+       * before it produces a frame, so the paint for a request reflects the
+       * page state at the time of the request (the headless deterministic
+       * BeginFrame setup). */
+      command_line->AppendSwitch("run-all-compositor-stages-before-draw");
+      command_line->AppendSwitch("disable-threaded-animation");
+      command_line->AppendSwitch("disable-threaded-scrolling");
+      command_line->AppendSwitch("disable-checker-imaging");
+    }
 
     bool gpu = src->gpu || (!!g_getenv ("GST_CEF_GPU_ENABLED"));
 
@@ -844,12 +887,103 @@ void BrowserApp::OnBeforeCommandLineProcessing(const CefString &process_type,
 
 /** cefsrc (Gstreamer) methods */
 
+static void
+gst_cef_send_begin_frame_on_ui_thread (CefRefPtr<CefBrowser> browser)
+{
+  CEF_REQUIRE_UI_THREAD();
+  if (browser && browser->GetHost())
+    browser->GetHost()->SendExternalBeginFrame();
+}
+
+/* Called with the object lock held. Waits for a frame request, issues one
+ * external BeginFrame and waits for its paint. Returns the requested running
+ * time, or GST_CLOCK_TIME_NONE when flushing. */
+static GstClockTime
+gst_cef_src_wait_locked_frame (GstCefSrc *src)
+{
+  GMutex *lock = GST_OBJECT_GET_LOCK (src);
+  GstClockTime *req;
+  GstClockTime running_time;
+  guint64 seq;
+  gint64 deadline;
+
+  while (g_queue_is_empty (src->frame_requests) && !src->flushing)
+    g_cond_wait (&src->frame_cond, lock);
+  if (src->flushing)
+    return GST_CLOCK_TIME_NONE;
+
+  req = (GstClockTime *) g_queue_pop_head (src->frame_requests);
+  running_time = *req;
+  g_free (req);
+
+  seq = src->paint_seq;
+  src->fl_begin_frame_at = g_get_monotonic_time ();
+  if (src->browser)
+    CefPostTask (TID_UI, base::BindOnce (&gst_cef_send_begin_frame_on_ui_thread, src->browser));
+
+  deadline = src->fl_begin_frame_at + (gint64) (src->frame_lock_timeout / GST_USECOND);
+  while (src->paint_seq == seq && !src->flushing) {
+    if (!g_cond_wait_until (&src->frame_cond, lock, deadline))
+      break;
+  }
+  if (src->flushing)
+    return GST_CLOCK_TIME_NONE;
+
+  src->fl_frames++;
+  if (src->paint_seq == seq) {
+    /* No paint: the page had nothing new to draw, or the browser is late.
+     * Repeat the last frame so the compositor still gets a buffer. */
+    src->fl_timeouts++;
+    src->fl_begin_frame_at = 0;
+    GST_CAT_DEBUG_OBJECT (cef_lock_debug, src, "rt %" GST_TIME_FORMAT " no paint within timeout",
+        GST_TIME_ARGS (running_time));
+  }
+
+  if (src->fl_frames % 250 == 0) {
+    GST_CAT_INFO_OBJECT (cef_lock_debug, src,
+        "frames %" G_GUINT64_FORMAT " timeouts %" G_GUINT64_FORMAT
+        " dropped requests %" G_GUINT64_FORMAT " paint mean %.2f ms max %.2f ms",
+        src->fl_frames, src->fl_timeouts, src->fl_dropped_requests,
+        src->fl_frames > src->fl_timeouts
+            ? src->fl_paint_us_sum / 1000.0 / (src->fl_frames - src->fl_timeouts) : 0.0,
+        src->fl_paint_us_max / 1000.0);
+    src->fl_paint_us_max = 0;
+  }
+
+  return running_time;
+}
+
+static void
+gst_cef_src_request_frame (GstCefSrc *src, guint64 running_time)
+{
+  GstClockTime *req = g_new (GstClockTime, 1);
+  *req = running_time;
+
+  GST_OBJECT_LOCK (src);
+  if (g_queue_get_length (src->frame_requests) >= FRAME_LOCK_MAX_PENDING) {
+    g_free (g_queue_pop_head (src->frame_requests));
+    src->fl_dropped_requests++;
+  }
+  g_queue_push_tail (src->frame_requests, req);
+  g_cond_broadcast (&src->frame_cond);
+  GST_OBJECT_UNLOCK (src);
+}
+
 static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
 {
   GstCefSrc *src = GST_CEF_SRC (push_src);
   GList *tmp;
+  GstClockTime locked_rt = GST_CLOCK_TIME_NONE;
 
   GST_OBJECT_LOCK (src);
+
+  if (src->frame_lock) {
+    locked_rt = gst_cef_src_wait_locked_frame (src);
+    if (!GST_CLOCK_TIME_IS_VALID (locked_rt)) {
+      GST_OBJECT_UNLOCK (src);
+      return GST_FLOW_FLUSHING;
+    }
+  }
 
   if (src->audio_events) {
     for (tmp = src->audio_events; tmp; tmp = tmp->next) {
@@ -868,7 +1002,12 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
     src->audio_buffers = NULL;
   }
 
-  GST_BUFFER_PTS (*buf) = gst_util_uint64_scale (src->n_frames, src->vinfo.fps_d * GST_SECOND, src->vinfo.fps_n);
+  if (src->frame_lock) {
+    GST_BUFFER_PTS (*buf) = locked_rt;
+    GST_BUFFER_DTS (*buf) = locked_rt;
+  } else {
+    GST_BUFFER_PTS (*buf) = gst_util_uint64_scale (src->n_frames, src->vinfo.fps_d * GST_SECOND, src->vinfo.fps_n);
+  }
   GST_BUFFER_DURATION (*buf) = gst_util_uint64_scale (GST_SECOND, src->vinfo.fps_d, src->vinfo.fps_n);
   src->n_frames++;
   GST_OBJECT_UNLOCK (src);
@@ -1152,6 +1291,10 @@ gst_cef_src_start(GstBaseSrc *base_src)
 
   GST_OBJECT_LOCK (src);
   src->n_frames = 0;
+  src->flushing = FALSE;
+  src->paint_seq = 0;
+  src->fl_frames = src->fl_timeouts = src->fl_dropped_requests = 0;
+  src->fl_paint_us_sum = src->fl_paint_us_max = src->fl_begin_frame_at = 0;
   GST_OBJECT_UNLOCK (src);
 
   GST_ELEMENT_PROGRESS(src, CONTINUE, "open", ("Creating CEF browser ..."));
@@ -1234,6 +1377,33 @@ gst_cef_src_stop (GstBaseSrc *base_src)
 
   gst_buffer_replace (&src->current_buffer, NULL);
 
+  GST_OBJECT_LOCK (src);
+  g_queue_clear_full (src->frame_requests, g_free);
+  GST_OBJECT_UNLOCK (src);
+
+  return TRUE;
+}
+
+static gboolean
+gst_cef_src_unlock (GstBaseSrc * base_src)
+{
+  GstCefSrc *src = GST_CEF_SRC (base_src);
+
+  GST_OBJECT_LOCK (src);
+  src->flushing = TRUE;
+  g_cond_broadcast (&src->frame_cond);
+  GST_OBJECT_UNLOCK (src);
+  return TRUE;
+}
+
+static gboolean
+gst_cef_src_unlock_stop (GstBaseSrc * base_src)
+{
+  GstCefSrc *src = GST_CEF_SRC (base_src);
+
+  GST_OBJECT_LOCK (src);
+  src->flushing = FALSE;
+  GST_OBJECT_UNLOCK (src);
   return TRUE;
 }
 
@@ -1243,6 +1413,13 @@ gst_cef_src_get_times (GstBaseSrc * base_src, GstBuffer * buffer,
 {
   GstClockTime timestamp = GST_BUFFER_PTS (buffer);
   GstClockTime duration = GST_BUFFER_DURATION (buffer);
+
+  /* A locked frame is produced after its running time has passed; the
+   * downstream aggregator waits for it within the reported latency. */
+  if (GST_CEF_SRC (base_src)->frame_lock) {
+    *start = *end = GST_CLOCK_TIME_NONE;
+    return;
+  }
 
   *end = timestamp + duration;
   *start = timestamp;
@@ -1261,7 +1438,11 @@ gst_cef_src_query (GstBaseSrc * base_src, GstQuery * query)
     {
       GstClockTime latency;
 
-      if (src->vinfo.fps_n) {
+      if (src->frame_lock) {
+        GST_DEBUG_OBJECT (src, "Reporting frame-lock latency: %" GST_TIME_FORMAT,
+            GST_TIME_ARGS (src->frame_lock_latency));
+        gst_query_set_latency (query, TRUE, src->frame_lock_latency, GST_CLOCK_TIME_NONE);
+      } else if (src->vinfo.fps_n) {
         latency = gst_util_uint64_scale (GST_SECOND, src->vinfo.fps_d, src->vinfo.fps_n);
         GST_DEBUG_OBJECT (src, "Reporting latency: %" GST_TIME_FORMAT, GST_TIME_ARGS (latency));
         gst_query_set_latency (query, TRUE, latency, GST_CLOCK_TIME_NONE);
@@ -1397,6 +1578,15 @@ gst_cef_src_set_property (GObject * object, guint prop_id, const GValue * value,
     case PROP_PAINT_RATE:
       src->paint_rate = g_value_get_int (value);
       break;
+    case PROP_FRAME_LOCK:
+      src->frame_lock = g_value_get_boolean (value);
+      break;
+    case PROP_FRAME_LOCK_LATENCY:
+      src->frame_lock_latency = g_value_get_uint64 (value);
+      break;
+    case PROP_FRAME_LOCK_TIMEOUT:
+      src->frame_lock_timeout = g_value_get_uint64 (value);
+      break;
     case PROP_SANDBOX:
     {
       GST_WARNING_OBJECT(
@@ -1472,6 +1662,15 @@ gst_cef_src_get_property (GObject * object, guint prop_id, GValue * value,
     case PROP_PAINT_RATE:
       g_value_set_int (value, src->paint_rate);
       break;
+    case PROP_FRAME_LOCK:
+      g_value_set_boolean (value, src->frame_lock);
+      break;
+    case PROP_FRAME_LOCK_LATENCY:
+      g_value_set_uint64 (value, src->frame_lock_latency);
+      break;
+    case PROP_FRAME_LOCK_TIMEOUT:
+      g_value_set_uint64 (value, src->frame_lock_timeout);
+      break;
     case PROP_SANDBOX:
       g_value_set_boolean (value, src->sandbox);
       break;
@@ -1516,6 +1715,9 @@ gst_cef_src_finalize (GObject *object)
   g_free (src->js_flags);
   g_free (src->cef_cache_location);
 
+  g_queue_free_full (src->frame_requests, g_free);
+  g_cond_clear (&src->frame_cond);
+
   g_cond_clear(&src->state_cond);
   g_mutex_clear(&src->state_lock);
 }
@@ -1545,6 +1747,13 @@ gst_cef_src_init (GstCefSrc * src)
   src->js_flags = NULL;
   src->log_severity = DEFAULT_LOG_SEVERITY;
   src->cef_cache_location = NULL;
+  src->frame_lock = DEFAULT_FRAME_LOCK;
+  src->frame_lock_latency = DEFAULT_FRAME_LOCK_LATENCY;
+  src->frame_lock_timeout = DEFAULT_FRAME_LOCK_TIMEOUT;
+  src->frame_requests = g_queue_new ();
+  g_cond_init (&src->frame_cond);
+  src->paint_seq = 0;
+  src->flushing = FALSE;
 
   gst_base_src_set_format (base_src, GST_FORMAT_TIME);
   gst_base_src_set_live (base_src, TRUE);
@@ -1631,6 +1840,41 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
           "deprecated: set GST_CEF_CACHE_LOCATION in the environment instead",
           NULL, (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
 
+  g_object_class_install_property (gobject_class, PROP_FRAME_LOCK,
+    g_param_spec_boolean ("frame-lock", "frame-lock",
+          "Paint only on request: each request-frame call issues one external "
+          "BeginFrame and the resulting buffer carries the requested running time. "
+          "Process-global browser switches follow the first cefsrc.",
+          DEFAULT_FRAME_LOCK,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
+
+  g_object_class_install_property (gobject_class, PROP_FRAME_LOCK_LATENCY,
+    g_param_spec_uint64 ("frame-lock-latency", "frame-lock-latency",
+          "Latency (ns) reported in frame-lock mode",
+          0, G_MAXUINT64, DEFAULT_FRAME_LOCK_LATENCY,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
+
+  g_object_class_install_property (gobject_class, PROP_FRAME_LOCK_TIMEOUT,
+    g_param_spec_uint64 ("frame-lock-timeout", "frame-lock-timeout",
+          "How long (ns) a locked frame waits for its paint before the last "
+          "frame is repeated",
+          0, G_MAXUINT64, DEFAULT_FRAME_LOCK_TIMEOUT,
+          (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_PLAYING)));
+
+  /**
+   * GstCefSrc::request-frame:
+   * @src: the cefsrc
+   * @running_time: running time (ns) of the video frame to render
+   *
+   * Frame-lock mode only. Queues one frame. The page must already hold the
+   * data for this frame (for example, set over the DevTools protocol).
+   */
+  gst_cef_src_signals[SIGNAL_REQUEST_FRAME] =
+      g_signal_new_class_handler ("request-frame", G_TYPE_FROM_CLASS (klass),
+      (GSignalFlags) (G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION),
+      G_CALLBACK (gst_cef_src_request_frame), NULL, NULL, NULL,
+      G_TYPE_NONE, 1, G_TYPE_UINT64);
+
   gst_element_class_set_static_metadata (gstelement_class,
       "Chromium Embedded Framework source", "Source/Video",
       "Creates a video stream from an embedded Chromium browser",
@@ -1645,6 +1889,8 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
   base_src_class->stop = GST_DEBUG_FUNCPTR(gst_cef_src_stop);
   base_src_class->get_times = GST_DEBUG_FUNCPTR(gst_cef_src_get_times);
   base_src_class->query = GST_DEBUG_FUNCPTR(gst_cef_src_query);
+  base_src_class->unlock = GST_DEBUG_FUNCPTR(gst_cef_src_unlock);
+  base_src_class->unlock_stop = GST_DEBUG_FUNCPTR(gst_cef_src_unlock_stop);
 
   gstelement_class->change_state = GST_DEBUG_FUNCPTR(gst_cef_src_change_state);
 
@@ -1654,4 +1900,6 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
       "Chromium Embedded Framework Source");
   GST_DEBUG_CATEGORY_INIT (cef_console_debug, "cefconsole", 0,
       "Chromium Embedded Framework JS Console");
+  GST_DEBUG_CATEGORY_INIT (cef_lock_debug, "ceflock", 0,
+      "Chromium Embedded Framework frame lock");
 }
