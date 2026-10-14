@@ -64,6 +64,38 @@ struct _GstCefSrc {
   gboolean listen_for_js_signals;
   gint chromium_debug_port;
   gint paint_rate;
+  /* Frame lock: the browser paints only when the pipeline asks for a frame.
+   * Each request-frame call carries the running time the frame belongs to;
+   * create() sends one external BeginFrame for it, waits for the paint and
+   * stamps the buffer with that running time. Guarded by the object lock. */
+  gboolean frame_lock;
+  GstClockTime frame_lock_latency;
+  GstClockTime frame_lock_timeout;
+  GQueue *frame_requests;
+  GCond frame_cond;
+  guint64 paint_seq;
+  gboolean flushing;
+  guint64 fl_frames;
+  guint64 fl_timeouts;
+  guint64 fl_dropped_requests;
+  gint64 fl_paint_us_sum;
+  gint64 fl_paint_us_max;
+  gint64 fl_begin_frame_at;
+  guint64 fl_paints_window;
+  gint64 fl_paints_window_start;
+
+  /* Frame tag: the browser paints freely; the page stamps each paint with the
+   * tag of the data frame it shows (9 px, bottom-right). OnPaint reads and
+   * clears the tag and keeps the latest paints; create() outputs the paint
+   * whose tag matches each request. */
+  gboolean frame_tag;
+  GstBuffer *tag_bufs[16];
+  gint64 tag_ids[16];
+  guint tag_count;
+  guint64 ft_exact;
+  guint64 ft_stale;
+  guint64 ft_ahead;
+  guint64 ft_untagged;
   CefRefPtr<CefBrowser> browser;
   CefRefPtr<CefApp> app;
 
