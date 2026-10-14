@@ -344,7 +344,7 @@ class RenderHandler : public CefRenderHandler
           const uint8_t* src_row = static_cast<const uint8_t*>(pixels);
           uint8_t* dst_row = map.data;
           for (int y = 0; y < height; y++, src_row += stride, dst_row += row_bytes)
-              memcpy(dst_row, src_row, row_bytes);
+              gst_cef_unpremultiply_bgra(dst_row, src_row, (size_t)width);
           gst_buffer_unmap(new_buffer, &map);
       }
 
