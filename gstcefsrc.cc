@@ -288,7 +288,13 @@ class RenderHandler : public CefRenderHandler
           gst_buffer_unref (new_buffer);
           return;
         }
+        /* Windows feeds the desktop app (NDI). Its output stays premultiplied
+         * until NDI receivers are checked; see OnAcceleratedPaint. */
+#ifdef _WIN32
+        memcpy (map.data, buffer, copy_size);
+#else
         gst_cef_unpremultiply_bgra (map.data, (const uint8_t *) buffer, copy_size / 4);
+#endif
         if (copy_size < target_size)
           memset (map.data + copy_size, 0, target_size - copy_size);
         gst_buffer_unmap (new_buffer, &map);
