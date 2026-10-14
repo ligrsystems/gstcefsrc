@@ -18,7 +18,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes libunwind-dev
-          sudo apt-get install --yes libgstreamer1.0-0 libgstreamer-plugins-base1.0-dev gstreamer1.0-tools xvfb
+          sudo apt-get install --yes libgstreamer1.0-0 libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-base xvfb
 
       - name: Cache
         id: cache-cmake
@@ -53,3 +53,22 @@ jobs:
             cefsrc listen-for-js-signals=true url="file://$PWD/html/ready_test.html" ! \
             "video/x-raw,width=1280,height=720,framerate=30/1" ! \
             fakesink sync=false
+
+      - name: test alpha conversion
+        run: |
+          c++ -std=c++14 -O2 -Wall -Wextra -Werror -I. tests/alpha_test.cc -o alpha-test
+          ./alpha-test
+
+      - name: test alpha pixels through compositor
+        run: |
+          export GST_PLUGIN_PATH="$PWD/build/Release:${GST_PLUGIN_PATH}"
+          timeout 120s xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" \
+            gst-launch-1.0 -e \
+            compositor name=comp background=black ! video/x-raw,format=BGRA ! filesink location=comp.bgra \
+            videotestsrc is-live=true num-buffers=90 pattern=solid-color foreground-color=0xff808080 ! \
+            "video/x-raw,format=BGRA,width=320,height=240,framerate=30/1" ! comp.sink_0 \
+            cefsrc num-buffers=90 url="file://$PWD/html/alpha_test.html" ! \
+            "video/x-raw,format=BGRA,width=320,height=240,framerate=30/1" ! tee name=t \
+            t. ! queue ! filesink location=raw.bgra \
+            t. ! queue ! comp.sink_1
+          python3 tests/check_alpha_frames.py raw.bgra comp.bgra 320 240 128

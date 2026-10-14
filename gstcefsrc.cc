@@ -20,6 +20,7 @@
 
 #include "gstcefsrc.h"
 #include "gstcefaudiometa.h"
+#include "gstcefalpha.h"
 #ifdef _WIN32
 #include "d3d11_texture_reader.h"
 #include <objbase.h>
@@ -280,9 +281,24 @@ class RenderHandler : public CefRenderHandler
       copy_size = MIN (target_size, source_size);
 
       new_buffer = gst_buffer_new_allocate (NULL, target_size, NULL);
-      gst_buffer_fill (new_buffer, 0, buffer, copy_size);
-      if (copy_size < target_size)
-        gst_buffer_memset (new_buffer, copy_size, 0, target_size - copy_size);
+      {
+        GstMapInfo map;
+        if (!gst_buffer_map (new_buffer, &map, GST_MAP_WRITE)) {
+          GST_ERROR_OBJECT (src, "Failed to map GstBuffer for CPU frame");
+          gst_buffer_unref (new_buffer);
+          return;
+        }
+        /* Windows feeds the desktop app (NDI). Its output stays premultiplied
+         * until NDI receivers are checked; see OnAcceleratedPaint. */
+#ifdef _WIN32
+        memcpy (map.data, buffer, copy_size);
+#else
+        gst_cef_unpremultiply_bgra (map.data, (const uint8_t *) buffer, copy_size / 4);
+#endif
+        if (copy_size < target_size)
+          memset (map.data + copy_size, 0, target_size - copy_size);
+        gst_buffer_unmap (new_buffer, &map);
+      }
 
       GST_OBJECT_LOCK (src);
       gst_buffer_replace (&(src->current_buffer), new_buffer);
