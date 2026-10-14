@@ -82,14 +82,45 @@ test_out_of_range_clamps (void)
       "clamp got %d %d %d %d", out[0], out[1], out[2], out[3]);
 }
 
+// The vector path must match the scalar path bit for bit: every (alpha,
+// colour) pair, invalid colour above alpha, and random groups mixing opaque,
+// clear and translucent pixels at every length remainder.
+static void
+test_vector_matches_scalar (void)
+{
+  std::vector<uint8_t> in;
+  for (int a = 0; a < 256; a++)
+    for (int c = 0; c < 256; c++) {
+      const uint8_t px[4] = { (uint8_t) c, (uint8_t) (255 - c), (uint8_t) (c * 7), (uint8_t) a };
+      in.insert (in.end (), px, px + 4);
+    }
+  uint32_t seed = 12345;
+  for (int i = 0; i < 40000; i++) {
+    seed = seed * 1664525u + 1013904223u;
+    const int kind = (seed >> 28) % 3;
+    const uint8_t a = kind == 0 ? 0 : kind == 1 ? 255 : (uint8_t) (seed >> 8);
+    const uint8_t px[4] = { (uint8_t) (seed >> 16), (uint8_t) (seed >> 4), (uint8_t) seed, a };
+    in.insert (in.end (), px, px + 4);
+  }
+  const size_t n = in.size () / 4;
+  for (size_t len = n - 3; len <= n; len++) {
+    std::vector<uint8_t> vec (len * 4), scalar (len * 4);
+    gst_cef_unpremultiply_bgra (vec.data (), in.data (), len);
+    gst_cef_unpremultiply_bgra_scalar (scalar.data (), in.data (), len);
+    CHECK (vec == scalar, "vector and scalar differ at length %zu", len);
+  }
+}
+
 static double
-time_frame_ms (const std::vector<uint8_t> & frame)
+time_frame_ms (const std::vector<uint8_t> & frame,
+    void (*convert) (uint8_t *, const uint8_t *, size_t) = gst_cef_unpremultiply_bgra)
 {
   std::vector<uint8_t> out (frame.size ());
   const int runs = 20;
+  convert (out.data (), frame.data (), frame.size () / 4);
   auto start = std::chrono::steady_clock::now ();
   for (int i = 0; i < runs; i++)
-    gst_cef_unpremultiply_bgra (out.data (), frame.data (), frame.size () / 4);
+    convert (out.data (), frame.data (), frame.size () / 4);
   auto end = std::chrono::steady_clock::now ();
   return std::chrono::duration<double, std::milli> (end - start).count () / runs;
 }
@@ -119,9 +150,11 @@ report_1080p_cost (void)
   auto end = std::chrono::steady_clock::now ();
   const double memcpy_ms =
       std::chrono::duration<double, std::milli> (end - start).count () / runs;
-  std::printf ("1080p per paint: memcpy %.2f ms, unpremultiply transparent %.2f ms, "
-      "full translucent %.2f ms\n", memcpy_ms, time_frame_ms (transparent),
-      time_frame_ms (translucent));
+  std::printf ("1080p per paint: memcpy %.2f ms; unpremultiply transparent %.2f ms, "
+      "full translucent %.2f ms; scalar only: transparent %.2f ms, full translucent %.2f ms\n",
+      memcpy_ms, time_frame_ms (transparent), time_frame_ms (translucent),
+      time_frame_ms (transparent, gst_cef_unpremultiply_bgra_scalar),
+      time_frame_ms (translucent, gst_cef_unpremultiply_bgra_scalar));
 }
 
 int
@@ -130,6 +163,7 @@ main (void)
   test_round_trip_matches_premultiplied_over ();
   test_fast_paths_and_channels ();
   test_out_of_range_clamps ();
+  test_vector_matches_scalar ();
   report_1080p_cost ();
   if (failures) {
     std::fprintf (stderr, "%d failure(s)\n", failures);
