@@ -21,6 +21,7 @@
 #include "gstcefsrc.h"
 #include "gstcefaudiometa.h"
 #include "gstcefalpha.h"
+#include "gstceftag.h"
 #ifdef _WIN32
 #include "d3d11_texture_reader.h"
 #include <objbase.h>
@@ -71,33 +72,14 @@ GST_DEBUG_CATEGORY_STATIC (cef_lock_debug);
 /* Interval between BeginFrame re-sends while a locked frame waits for paint. */
 #define FRAME_LOCK_RESEND_US 2000
 #define FRAME_TAG_RING 16
-#define FRAME_TAG_PIXELS 9
-#define FRAME_TAG_MASK 0xffffff
+/* Video frames without a readable tag, while paints keep coming, before the
+ * newest paint goes out unpaired (a graphic over the tag). */
+#define FRAME_TAG_FALLBACK_FRAMES 3
 
 typedef struct {
   GstClockTime running_time;
   gint64 tag; /* -1 for an untagged (frame-lock) request */
 } CefFrameRequest;
-
-/* Reads the frame tag from the bottom-right FRAME_TAG_PIXELS of a BGRA frame:
- * a magenta marker, then 8 pixels holding 3 bits each in R, G, B (MSB first
- * per pixel), least significant pixel first. Returns -1 when absent. */
-static gint64
-gst_cef_read_frame_tag (const guint8 *bgra, int w, int h)
-{
-  if (w < FRAME_TAG_PIXELS || h < 1)
-    return -1;
-  const guint8 *row = bgra + ((gsize) (h - 1) * w + (w - FRAME_TAG_PIXELS)) * 4;
-  if (row[0] < 200 || row[1] > 55 || row[2] < 200 || row[3] < 200)
-    return -1;
-  gint64 tag = 0;
-  for (int j = 0; j < 8; j++) {
-    const guint8 *px = row + (1 + j) * 4;
-    gint64 bits = ((px[2] >= 128) << 2) | ((px[1] >= 128) << 1) | (px[0] >= 128);
-    tag |= bits << (3 * j);
-  }
-  return tag;
-}
 
 static gboolean
 gst_cef_tag_not_before (gint64 a, gint64 b)
@@ -371,9 +353,14 @@ class RenderHandler : public CefRenderHandler
       GST_OBJECT_LOCK (src);
       gst_buffer_replace (&(src->current_buffer), new_buffer);
       if (src->frame_tag && type == PET_VIEW) {
+        gint64 painted_at = g_get_monotonic_time ();
         if (tag < 0) {
           src->ft_untagged++;
+          src->last_untagged_us = painted_at;
+          /* A waiting request may give up on tags (FRAME_TAG_FALLBACK_FRAMES). */
+          g_cond_broadcast (&src->frame_cond);
         } else {
+          src->last_tagged_us = painted_at;
           guint slot;
           if (src->tag_count < FRAME_TAG_RING) {
             slot = src->tag_count++;
@@ -1055,6 +1042,17 @@ gst_cef_src_wait_locked_frame (GstCefSrc *src)
   return running_time;
 }
 
+/* Called with the object lock held. The page still paints, but no tag has
+ * read for FRAME_TAG_FALLBACK_FRAMES video frames. */
+static gboolean
+gst_cef_src_tags_lost (GstCefSrc *src)
+{
+  if (src->last_untagged_us <= src->last_tagged_us || src->vinfo.fps_n <= 0)
+    return FALSE;
+  gint64 frame_us = (gint64) gst_util_uint64_scale (G_USEC_PER_SEC, src->vinfo.fps_d, src->vinfo.fps_n);
+  return g_get_monotonic_time () - src->last_tagged_us > FRAME_TAG_FALLBACK_FRAMES * frame_us;
+}
+
 /* Called with the object lock held. Waits for a tagged request and for the
  * paint carrying its tag. Sets *out to a new ref of the chosen paint (or NULL
  * when none exists yet). Returns the requested running time, or
@@ -1079,10 +1077,15 @@ gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out)
   want = req->tag & FRAME_TAG_MASK;
   g_free (req);
 
-  /* Wait until a paint at or after the wanted tag exists. */
+  /* Wait until a paint at or after the wanted tag exists. When the page keeps
+   * painting but no tag reads (a graphic over it, a blend), stop waiting:
+   * the newest paint goes out unpaired, instead of an older tagged paint for
+   * ever (a frozen overlay). */
   deadline = g_get_monotonic_time () + (gint64) (src->frame_lock_timeout / GST_USECOND);
   while (!src->flushing) {
     if (src->tag_count > 0 && gst_cef_tag_not_before (src->tag_ids[src->tag_count - 1], want))
+      break;
+    if (gst_cef_src_tags_lost (src))
       break;
     if (!g_cond_wait_until (&src->frame_cond, lock, deadline))
       break;
@@ -1090,16 +1093,20 @@ gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out)
   if (src->flushing)
     return GST_CLOCK_TIME_NONE;
 
-  /* Exact paint, else the newest paint before it (a repeat). */
+  /* Exact paint, else the newest paint before it (a repeat). Unpaired, *out
+   * stays NULL and the newest paint goes out. */
   gint best = -1;
-  for (gint i = src->tag_count - 1; i >= 0; i--) {
+  gboolean unpaired = gst_cef_src_tags_lost (src);
+  if (unpaired)
+    src->ft_unpaired++;
+  for (gint i = src->tag_count - 1; i >= 0 && !unpaired; i--) {
     if (src->tag_ids[i] == want) {
       best = i;
       src->ft_exact++;
       break;
     }
   }
-  if (best < 0) {
+  if (best < 0 && !unpaired) {
     for (gint i = src->tag_count - 1; i >= 0; i--) {
       if (!gst_cef_tag_not_before (src->tag_ids[i], want + 1)) {
         best = i;
@@ -1108,7 +1115,7 @@ gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out)
       }
     }
   }
-  if (best < 0 && src->tag_count > 0) {
+  if (best < 0 && !unpaired && src->tag_count > 0) {
     best = 0;
     src->ft_ahead++;
   }
@@ -1119,9 +1126,9 @@ gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out)
   if (src->fl_frames % 250 == 0) {
     GST_CAT_INFO_OBJECT (cef_lock_debug, src,
         "tagged frames %" G_GUINT64_FORMAT " exact %" G_GUINT64_FORMAT " stale %" G_GUINT64_FORMAT
-        " ahead %" G_GUINT64_FORMAT " untagged paints %" G_GUINT64_FORMAT
+        " ahead %" G_GUINT64_FORMAT " unpaired %" G_GUINT64_FORMAT " untagged paints %" G_GUINT64_FORMAT
         " dropped requests %" G_GUINT64_FORMAT,
-        src->fl_frames, src->ft_exact, src->ft_stale, src->ft_ahead, src->ft_untagged,
+        src->fl_frames, src->ft_exact, src->ft_stale, src->ft_ahead, src->ft_unpaired, src->ft_untagged,
         src->fl_dropped_requests);
   }
   return running_time;
@@ -1494,7 +1501,8 @@ gst_cef_src_start(GstBaseSrc *base_src)
   src->paint_seq = 0;
   src->fl_frames = src->fl_timeouts = src->fl_dropped_requests = 0;
   src->fl_paint_us_sum = src->fl_paint_us_max = src->fl_begin_frame_at = 0;
-  src->ft_exact = src->ft_stale = src->ft_ahead = src->ft_untagged = 0;
+  src->ft_exact = src->ft_stale = src->ft_ahead = src->ft_untagged = src->ft_unpaired = 0;
+  src->last_tagged_us = src->last_untagged_us = 0;
   GST_OBJECT_UNLOCK (src);
 
   GST_ELEMENT_PROGRESS(src, CONTINUE, "open", ("Creating CEF browser ..."));
@@ -2083,9 +2091,10 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_FRAME_TAG,
     g_param_spec_boolean ("frame-tag", "frame-tag",
-          "The page stamps each paint with a frame tag (9 px, bottom-right); "
-          "each request-tagged-frame call outputs the paint with that tag, "
-          "stamped with the requested running time. The browser paints freely.",
+          "The page stamps each paint with a checked frame tag (11 px, bottom-right, "
+          "gstceftag.h); each request-tagged-frame call outputs the paint with that tag, "
+          "stamped with the requested running time. The browser paints freely. While "
+          "paints come without a readable tag, the newest paint goes out unpaired.",
           FALSE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
 

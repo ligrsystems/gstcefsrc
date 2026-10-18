@@ -59,6 +59,11 @@ jobs:
           c++ -std=c++14 -O2 -Wall -Wextra -Werror -I. tests/alpha_test.cc -o alpha-test
           ./alpha-test
 
+      - name: test frame tag reader
+        run: |
+          c++ -std=c++14 -O2 -Wall -Wextra -Werror -I. tests/tag_test.cc -o tag-test
+          ./tag-test
+
       - name: test alpha pixels through compositor
         run: |
           export GST_PLUGIN_PATH="$PWD/build/Release:${GST_PLUGIN_PATH}"
