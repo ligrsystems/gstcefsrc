@@ -142,6 +142,25 @@ main ()
     CHECK (gst_cef_read_frame_tag (f.data (), 8, 1) == -1, "an 8 px frame reads a tag");
   }
 
+  // The running time of each recent tagged request, by tag: what an output
+  // buffer's paint shows. Tags run in sequence and wrap at 24 bits.
+  {
+    GstCefTagTimes t = {};
+    uint64_t time = 0;
+    CHECK (!gst_cef_tag_times_get (&t, 7, &time), "a tag never requested has a time");
+    const uint32_t first = FRAME_TAG_MASK - 10;
+    for (uint32_t k = 0; k < 200; k++)
+      gst_cef_tag_times_put (&t, (first + k) & FRAME_TAG_MASK, 1000000000ull + k * 20000000ull);
+    const uint32_t newest = (first + 199) & FRAME_TAG_MASK;
+    CHECK (gst_cef_tag_times_get (&t, newest, &time) && time == 1000000000ull + 199 * 20000000ull,
+        "the newest tag's time");
+    const uint32_t oldest_kept = (first + 200 - FRAME_TAG_TIMES) & FRAME_TAG_MASK;
+    CHECK (gst_cef_tag_times_get (&t, oldest_kept, &time) && time == 1000000000ull + (200 - FRAME_TAG_TIMES) * 20000000ull,
+        "the oldest kept tag's time");
+    CHECK (!gst_cef_tag_times_get (&t, (oldest_kept - 1) & FRAME_TAG_MASK, &time), "a tag older than the ring has a time");
+    CHECK (!gst_cef_tag_times_get (&t, (newest + 1) & FRAME_TAG_MASK, &time), "a tag not yet requested has a time");
+  }
+
   if (failures) {
     std::fprintf (stderr, "%d failures\n", failures);
     return 1;

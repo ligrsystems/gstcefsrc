@@ -1,6 +1,10 @@
 #ifndef __GST_CEF_SRC_H__
 #define __GST_CEF_SRC_H__
 
+/* Caps of the GstReferenceTimestampMeta on frame-tag output buffers: its
+ * timestamp is the running time of the frame the buffer's paint shows. */
+#define GST_CEF_PAINT_FRAME_CAPS "timestamp/x-ligr-paint-frame"
+
 #include "include/cef_browser_process_handler.h"
 #include <gst/gst.h>
 #include <gst/base/gstpushsrc.h>
@@ -11,6 +15,7 @@
 #include <include/cef_life_span_handler.h>
 #include <include/cef_load_handler.h>
 #include <include/wrapper/cef_helpers.h>
+#include "gstceftag.h"
 
 #ifdef _WIN32
 class D3D11TextureReader;
@@ -98,6 +103,13 @@ struct _GstCefSrc {
   guint64 ft_untagged;
   /* Frames sent unpaired: paints kept coming without a readable tag. */
   guint64 ft_unpaired;
+  /* The running time each recent tag was requested for. Every paired output
+   * buffer carries a GstReferenceTimestampMeta (caps GST_CEF_PAINT_FRAME_CAPS)
+   * with the running time of the frame its paint shows, so a downstream
+   * compositor knows which frame's data the overlay drew (a repeat or an
+   * ahead paint differs from the buffer's PTS). Unpaired buffers carry none. */
+  GstCefTagTimes tag_times;
+  GstCaps *paint_frame_caps;
   /* Monotonic time of the last paint with and without a readable tag. */
   gint64 last_tagged_us;
   gint64 last_untagged_us;

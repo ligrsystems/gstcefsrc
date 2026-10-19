@@ -1055,10 +1055,10 @@ gst_cef_src_tags_lost (GstCefSrc *src)
 
 /* Called with the object lock held. Waits for a tagged request and for the
  * paint carrying its tag. Sets *out to a new ref of the chosen paint (or NULL
- * when none exists yet). Returns the requested running time, or
- * GST_CLOCK_TIME_NONE when flushing. */
+ * when none exists yet) and *paint_tag to that paint's tag (-1 with none).
+ * Returns the requested running time, or GST_CLOCK_TIME_NONE when flushing. */
 static GstClockTime
-gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out)
+gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out, gint64 *paint_tag)
 {
   GMutex *lock = GST_OBJECT_GET_LOCK (src);
   CefFrameRequest *req;
@@ -1067,6 +1067,7 @@ gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out)
   gint64 deadline;
 
   *out = NULL;
+  *paint_tag = -1;
   while (g_queue_is_empty (src->frame_requests) && !src->flushing)
     g_cond_wait (&src->frame_cond, lock);
   if (src->flushing)
@@ -1119,8 +1120,10 @@ gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out)
     best = 0;
     src->ft_ahead++;
   }
-  if (best >= 0)
+  if (best >= 0) {
     *out = gst_buffer_ref (src->tag_bufs[best]);
+    *paint_tag = src->tag_ids[best];
+  }
 
   src->fl_frames++;
   if (src->fl_frames % 250 == 0) {
@@ -1142,6 +1145,8 @@ gst_cef_src_queue_request (GstCefSrc *src, guint64 running_time, gint64 tag)
   req->tag = tag;
 
   GST_OBJECT_LOCK (src);
+  if (tag >= 0)
+    gst_cef_tag_times_put (&src->tag_times, (guint32) (tag & FRAME_TAG_MASK), running_time);
   if (g_queue_get_length (src->frame_requests) >= FRAME_LOCK_MAX_PENDING) {
     g_free (g_queue_pop_head (src->frame_requests));
     src->fl_dropped_requests++;
@@ -1169,11 +1174,12 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
   GList *tmp;
   GstClockTime locked_rt = GST_CLOCK_TIME_NONE;
   GstBuffer *tagged = NULL;
+  gint64 paint_tag = -1;
 
   GST_OBJECT_LOCK (src);
 
   if (src->frame_tag) {
-    locked_rt = gst_cef_src_wait_tagged_frame (src, &tagged);
+    locked_rt = gst_cef_src_wait_tagged_frame (src, &tagged, &paint_tag);
     if (!GST_CLOCK_TIME_IS_VALID (locked_rt)) {
       GST_OBJECT_UNLOCK (src);
       return GST_FLOW_FLUSHING;
@@ -1197,8 +1203,12 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
 
   g_assert (src->current_buffer);
   if (tagged) {
+    guint64 paint_rt;
+
     *buf = gst_buffer_copy (tagged);
     gst_buffer_unref (tagged);
+    if (gst_cef_tag_times_get (&src->tag_times, (guint32) paint_tag, &paint_rt))
+      gst_buffer_add_reference_timestamp_meta (*buf, src->paint_frame_caps, paint_rt, GST_CLOCK_TIME_NONE);
   } else {
     *buf = gst_buffer_copy (src->current_buffer);
   }
@@ -1590,6 +1600,7 @@ gst_cef_src_stop (GstBaseSrc *base_src)
   for (guint i = 0; i < src->tag_count; i++)
     gst_buffer_unref (src->tag_bufs[i]);
   src->tag_count = 0;
+  memset (&src->tag_times, 0, sizeof (src->tag_times));
   GST_OBJECT_UNLOCK (src);
 
   return TRUE;
@@ -1942,6 +1953,7 @@ gst_cef_src_finalize (GObject *object)
   g_free (src->cef_cache_location);
 
   g_queue_free_full (src->frame_requests, g_free);
+  gst_caps_unref (src->paint_frame_caps);
   g_cond_clear (&src->frame_cond);
 
   g_cond_clear(&src->state_cond);
@@ -1979,6 +1991,8 @@ gst_cef_src_init (GstCefSrc * src)
   src->frame_requests = g_queue_new ();
   src->frame_tag = FALSE;
   src->tag_count = 0;
+  memset (&src->tag_times, 0, sizeof (src->tag_times));
+  src->paint_frame_caps = gst_caps_new_empty_simple (GST_CEF_PAINT_FRAME_CAPS);
   g_cond_init (&src->frame_cond);
   src->paint_seq = 0;
   src->flushing = FALSE;
@@ -2093,8 +2107,10 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
     g_param_spec_boolean ("frame-tag", "frame-tag",
           "The page stamps each paint with a checked frame tag (11 px, bottom-right, "
           "gstceftag.h); each request-tagged-frame call outputs the paint with that tag, "
-          "stamped with the requested running time. The browser paints freely. While "
-          "paints come without a readable tag, the newest paint goes out unpaired.",
+          "stamped with the requested running time. A paired buffer also carries a "
+          "GstReferenceTimestampMeta (timestamp/x-ligr-paint-frame) with the running time "
+          "of the frame its paint shows. The browser paints freely. While paints come "
+          "without a readable tag, the newest paint goes out unpaired, with no such meta.",
           FALSE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));
 
