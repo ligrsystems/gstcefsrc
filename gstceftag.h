@@ -74,4 +74,38 @@ gst_cef_read_frame_tag (const uint8_t *bgra, int w, int h)
   return check == gst_cef_frame_tag_check (tag) ? (int64_t) tag : -1;
 }
 
+/* The running time each recent tagged request asked for, by tag. Frame-tag
+ * mode stamps an output buffer with the running time of the frame its paint
+ * shows: the request that carried the paint's tag. Requests come one per
+ * video frame with tags in sequence, so FRAME_TAG_TIMES recent ones (about
+ * 1.3 s at 50 fps) cover any paint the output can repeat. */
+#define FRAME_TAG_TIMES 64
+
+typedef struct {
+  uint32_t tag[FRAME_TAG_TIMES];
+  uint64_t time[FRAME_TAG_TIMES];
+  uint8_t set[FRAME_TAG_TIMES];
+} GstCefTagTimes;
+
+static inline void
+gst_cef_tag_times_put (GstCefTagTimes *t, uint32_t tag, uint64_t time)
+{
+  size_t i = tag % FRAME_TAG_TIMES;
+  t->tag[i] = tag;
+  t->time[i] = time;
+  t->set[i] = 1;
+}
+
+/* 1 and the running time requested with `tag`, or 0 when it is too old or
+ * was never requested. */
+static inline int
+gst_cef_tag_times_get (const GstCefTagTimes *t, uint32_t tag, uint64_t *time)
+{
+  size_t i = tag % FRAME_TAG_TIMES;
+  if (!t->set[i] || t->tag[i] != tag)
+    return 0;
+  *time = t->time[i];
+  return 1;
+}
+
 #endif /* __GST_CEF_TAG_H__ */
