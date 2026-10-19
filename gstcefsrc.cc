@@ -72,6 +72,8 @@ GST_DEBUG_CATEGORY_STATIC (cef_lock_debug);
 /* Interval between BeginFrame re-sends while a locked frame waits for paint. */
 #define FRAME_LOCK_RESEND_US 2000
 #define FRAME_TAG_RING 16
+/* A repeat comes from the paint ring, so the request times must reach as far. */
+G_STATIC_ASSERT (FRAME_TAG_TIMES >= FRAME_TAG_RING);
 /* Video frames without a readable tag, while paints keep coming, before the
  * newest paint goes out unpaired (a graphic over the tag). */
 #define FRAME_TAG_FALLBACK_FRAMES 3
@@ -1130,9 +1132,9 @@ gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out, gint64 *paint_ta
     GST_CAT_INFO_OBJECT (cef_lock_debug, src,
         "tagged frames %" G_GUINT64_FORMAT " exact %" G_GUINT64_FORMAT " stale %" G_GUINT64_FORMAT
         " ahead %" G_GUINT64_FORMAT " unpaired %" G_GUINT64_FORMAT " untagged paints %" G_GUINT64_FORMAT
-        " dropped requests %" G_GUINT64_FORMAT,
+        " dropped requests %" G_GUINT64_FORMAT " paired without paint-frame time %" G_GUINT64_FORMAT,
         src->fl_frames, src->ft_exact, src->ft_stale, src->ft_ahead, src->ft_unpaired, src->ft_untagged,
-        src->fl_dropped_requests);
+        src->fl_dropped_requests, src->ft_unstamped);
   }
   return running_time;
 }
@@ -1209,6 +1211,8 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
     gst_buffer_unref (tagged);
     if (gst_cef_tag_times_get (&src->tag_times, (guint32) paint_tag, &paint_rt))
       gst_buffer_add_reference_timestamp_meta (*buf, src->paint_frame_caps, paint_rt, GST_CLOCK_TIME_NONE);
+    else
+      src->ft_unstamped++;
   } else {
     *buf = gst_buffer_copy (src->current_buffer);
   }
@@ -1511,7 +1515,7 @@ gst_cef_src_start(GstBaseSrc *base_src)
   src->paint_seq = 0;
   src->fl_frames = src->fl_timeouts = src->fl_dropped_requests = 0;
   src->fl_paint_us_sum = src->fl_paint_us_max = src->fl_begin_frame_at = 0;
-  src->ft_exact = src->ft_stale = src->ft_ahead = src->ft_untagged = src->ft_unpaired = 0;
+  src->ft_exact = src->ft_stale = src->ft_ahead = src->ft_untagged = src->ft_unpaired = src->ft_unstamped = 0;
   src->last_tagged_us = src->last_untagged_us = 0;
   GST_OBJECT_UNLOCK (src);
 
@@ -2107,7 +2111,8 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
     g_param_spec_boolean ("frame-tag", "frame-tag",
           "The page stamps each paint with a checked frame tag (11 px, bottom-right, "
           "gstceftag.h); each request-tagged-frame call outputs the paint with that tag, "
-          "stamped with the requested running time. A paired buffer also carries a "
+          "stamped with the requested running time. A paired buffer whose paint's tag was "
+          "requested within the last FRAME_TAG_TIMES (64) requests also carries a "
           "GstReferenceTimestampMeta (timestamp/x-ligr-paint-frame) with the running time "
           "of the frame its paint shows. The browser paints freely. While paints come "
           "without a readable tag, the newest paint goes out unpaired, with no such meta.",

@@ -103,6 +103,9 @@ struct _GstCefSrc {
   guint64 ft_untagged;
   /* Frames sent unpaired: paints kept coming without a readable tag. */
   guint64 ft_unpaired;
+  /* Paired frames sent without a paint-frame time: the paint's tag was not
+   * among the recent requests (gst_cef_tag_times_get). */
+  guint64 ft_unstamped;
   /* The running time each recent tag was requested for. Every paired output
    * buffer carries a GstReferenceTimestampMeta (caps GST_CEF_PAINT_FRAME_CAPS)
    * with the running time of the frame its paint shows, so a downstream
