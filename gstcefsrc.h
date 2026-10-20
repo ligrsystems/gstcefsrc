@@ -4,6 +4,10 @@
 /* Caps of the GstReferenceTimestampMeta on frame-tag output buffers: its
  * timestamp is the running time of the frame the buffer's paint shows. */
 #define GST_CEF_PAINT_FRAME_CAPS "timestamp/x-ligr-paint-frame"
+/* Caps of a second GstReferenceTimestampMeta, on paired buffers whose paint
+ * carries a squeeze tag (gstceftag.h): the running time of the frame the
+ * graphic claiming a squeeze shows. */
+#define GST_CEF_SQUEEZE_FRAME_CAPS "timestamp/x-ligr-squeeze-frame"
 
 #include "include/cef_browser_process_handler.h"
 #include <gst/gst.h>
@@ -96,6 +100,8 @@ struct _GstCefSrc {
   gboolean frame_tag;
   GstBuffer *tag_bufs[16];
   gint64 tag_ids[16];
+  /* Each kept paint's squeeze tag, -1 without one. */
+  gint64 tag_squeeze[16];
   guint tag_count;
   guint64 ft_exact;
   guint64 ft_stale;
@@ -106,6 +112,8 @@ struct _GstCefSrc {
   /* Paired frames sent without a paint-frame time: the paint's tag was not
    * among the recent requests (gst_cef_tag_times_get). */
   guint64 ft_unstamped;
+  /* Paired frames stamped with a squeeze-frame time. */
+  guint64 ft_squeeze;
   /* The running time each recent tag was requested for. Every paired output
    * buffer carries a GstReferenceTimestampMeta (caps GST_CEF_PAINT_FRAME_CAPS)
    * with the running time of the frame its paint shows, so a downstream
@@ -113,6 +121,7 @@ struct _GstCefSrc {
    * ahead paint differs from the buffer's PTS). Unpaired buffers carry none. */
   GstCefTagTimes tag_times;
   GstCaps *paint_frame_caps;
+  GstCaps *squeeze_frame_caps;
   /* Monotonic time of the last paint with and without a readable tag. */
   gint64 last_tagged_us;
   gint64 last_untagged_us;

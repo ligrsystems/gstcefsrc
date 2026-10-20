@@ -21,11 +21,9 @@ static const int W = 64, H = 4;
 
 // The page's encoder (ligr packages/shared/src/ar/tag.ts, encodeTag), as BGRA
 // at the bottom right of a W x H frame over a mid-grey picture.
-static std::vector<uint8_t>
-frame_with_tag (uint32_t tag)
+static void
+draw_tag (uint8_t *row, uint32_t tag)
 {
-  std::vector<uint8_t> f (W * H * 4, 128);
-  uint8_t *row = f.data () + ((H - 1) * W + (W - FRAME_TAG_PIXELS)) * 4;
   const uint8_t marker[4] = { 255, 0, 255, 255 };
   for (int c = 0; c < 4; c++)
     row[c] = marker[c];
@@ -38,6 +36,13 @@ frame_with_tag (uint32_t tag)
     px[0] = bits & 1 ? 255 : 0;  // B
     px[3] = 255;
   }
+}
+
+static std::vector<uint8_t>
+frame_with_tag (uint32_t tag)
+{
+  std::vector<uint8_t> f (W * H * 4, 128);
+  draw_tag (f.data () + ((H - 1) * W + (W - FRAME_TAG_PIXELS)) * 4, tag);
   return f;
 }
 
@@ -140,6 +145,24 @@ main ()
   {
     std::vector<uint8_t> f (8 * 1 * 4, 255);
     CHECK (gst_cef_read_frame_tag (f.data (), 8, 1) == -1, "an 8 px frame reads a tag");
+  }
+
+  // The squeeze tag: the claiming graphic's own tag at the bottom left, read
+  // apart from the frame tag (each frame of the page paints on its own schedule).
+  {
+    std::vector<uint8_t> f = frame_with_tag (0x000105);
+    CHECK (gst_cef_read_squeeze_tag (f.data (), W, H) == -1, "a paint without a squeeze tag reads one");
+    draw_tag (f.data () + (H - 1) * W * 4, 0x000104);
+    CHECK (gst_cef_read_frame_tag (f.data (), W, H) == 0x000105, "the frame tag beside a squeeze tag");
+    CHECK (gst_cef_read_squeeze_tag (f.data (), W, H) == 0x000104, "the squeeze tag does not read back");
+    tag_pixel (f, 0)[0] = 0;
+    CHECK (gst_cef_read_squeeze_tag (f.data (), W, H) == 0x000104, "the frame tag's marker changes the squeeze tag");
+    uint8_t *px = f.data () + ((H - 1) * W + 3) * 4;
+    px[3] = 128;
+    CHECK (gst_cef_read_squeeze_tag (f.data (), W, H) == -1, "a translucent squeeze tag pixel reads");
+    std::vector<uint8_t> narrow (21 * 1 * 4, 0);
+    draw_tag (narrow.data (), 0x000104);
+    CHECK (gst_cef_read_squeeze_tag (narrow.data (), 21, 1) == -1, "a squeeze tag reads where it would overlap the frame tag");
   }
 
   // The running time of each recent tagged request, by tag: what an output

@@ -342,13 +342,16 @@ class RenderHandler : public CefRenderHandler
         gst_buffer_unmap (new_buffer, &map);
       }
 
-      gint64 tag = -1;
+      gint64 tag = -1, squeeze = -1;
       if (src->frame_tag && type == PET_VIEW && (guint) w == target_width && (guint) h == target_height) {
         tag = gst_cef_read_frame_tag ((const guint8 *) buffer, w, h);
         if (tag >= 0) {
-          /* The tag is not part of the picture: make it transparent. */
+          /* The tags are not part of the picture: make them transparent. */
           gst_buffer_memset (new_buffer,
               ((gsize) (h - 1) * w + (w - FRAME_TAG_PIXELS)) * 4, 0, FRAME_TAG_PIXELS * 4);
+          squeeze = gst_cef_read_squeeze_tag ((const guint8 *) buffer, w, h);
+          if (squeeze >= 0)
+            gst_buffer_memset (new_buffer, (gsize) (h - 1) * w * 4, 0, FRAME_TAG_PIXELS * 4);
         }
       }
 
@@ -370,10 +373,12 @@ class RenderHandler : public CefRenderHandler
             gst_buffer_unref (src->tag_bufs[0]);
             memmove (&src->tag_bufs[0], &src->tag_bufs[1], sizeof (GstBuffer *) * (FRAME_TAG_RING - 1));
             memmove (&src->tag_ids[0], &src->tag_ids[1], sizeof (gint64) * (FRAME_TAG_RING - 1));
+            memmove (&src->tag_squeeze[0], &src->tag_squeeze[1], sizeof (gint64) * (FRAME_TAG_RING - 1));
             slot = FRAME_TAG_RING - 1;
           }
           src->tag_bufs[slot] = gst_buffer_ref (new_buffer);
           src->tag_ids[slot] = tag;
+          src->tag_squeeze[slot] = squeeze;
           src->paint_seq++;
           g_cond_broadcast (&src->frame_cond);
         }
@@ -1057,10 +1062,11 @@ gst_cef_src_tags_lost (GstCefSrc *src)
 
 /* Called with the object lock held. Waits for a tagged request and for the
  * paint carrying its tag. Sets *out to a new ref of the chosen paint (or NULL
- * when none exists yet) and *paint_tag to that paint's tag (-1 with none).
+ * when none exists yet), *paint_tag to that paint's tag and *squeeze_tag to
+ * its squeeze tag (-1 with none).
  * Returns the requested running time, or GST_CLOCK_TIME_NONE when flushing. */
 static GstClockTime
-gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out, gint64 *paint_tag)
+gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out, gint64 *paint_tag, gint64 *squeeze_tag)
 {
   GMutex *lock = GST_OBJECT_GET_LOCK (src);
   CefFrameRequest *req;
@@ -1070,6 +1076,7 @@ gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out, gint64 *paint_ta
 
   *out = NULL;
   *paint_tag = -1;
+  *squeeze_tag = -1;
   while (g_queue_is_empty (src->frame_requests) && !src->flushing)
     g_cond_wait (&src->frame_cond, lock);
   if (src->flushing)
@@ -1125,6 +1132,7 @@ gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out, gint64 *paint_ta
   if (best >= 0) {
     *out = gst_buffer_ref (src->tag_bufs[best]);
     *paint_tag = src->tag_ids[best];
+    *squeeze_tag = src->tag_squeeze[best];
   }
 
   src->fl_frames++;
@@ -1132,9 +1140,10 @@ gst_cef_src_wait_tagged_frame (GstCefSrc *src, GstBuffer **out, gint64 *paint_ta
     GST_CAT_INFO_OBJECT (cef_lock_debug, src,
         "tagged frames %" G_GUINT64_FORMAT " exact %" G_GUINT64_FORMAT " stale %" G_GUINT64_FORMAT
         " ahead %" G_GUINT64_FORMAT " unpaired %" G_GUINT64_FORMAT " untagged paints %" G_GUINT64_FORMAT
-        " dropped requests %" G_GUINT64_FORMAT " paired without paint-frame time %" G_GUINT64_FORMAT,
+        " dropped requests %" G_GUINT64_FORMAT " paired without paint-frame time %" G_GUINT64_FORMAT
+        " with squeeze-frame time %" G_GUINT64_FORMAT,
         src->fl_frames, src->ft_exact, src->ft_stale, src->ft_ahead, src->ft_unpaired, src->ft_untagged,
-        src->fl_dropped_requests, src->ft_unstamped);
+        src->fl_dropped_requests, src->ft_unstamped, src->ft_squeeze);
   }
   return running_time;
 }
@@ -1177,11 +1186,12 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
   GstClockTime locked_rt = GST_CLOCK_TIME_NONE;
   GstBuffer *tagged = NULL;
   gint64 paint_tag = -1;
+  gint64 squeeze_tag = -1;
 
   GST_OBJECT_LOCK (src);
 
   if (src->frame_tag) {
-    locked_rt = gst_cef_src_wait_tagged_frame (src, &tagged, &paint_tag);
+    locked_rt = gst_cef_src_wait_tagged_frame (src, &tagged, &paint_tag, &squeeze_tag);
     if (!GST_CLOCK_TIME_IS_VALID (locked_rt)) {
       GST_OBJECT_UNLOCK (src);
       return GST_FLOW_FLUSHING;
@@ -1213,6 +1223,10 @@ static GstFlowReturn gst_cef_src_create(GstPushSrc *push_src, GstBuffer **buf)
       gst_buffer_add_reference_timestamp_meta (*buf, src->paint_frame_caps, paint_rt, GST_CLOCK_TIME_NONE);
     else
       src->ft_unstamped++;
+    if (squeeze_tag >= 0 && gst_cef_tag_times_get (&src->tag_times, (guint32) squeeze_tag, &paint_rt)) {
+      gst_buffer_add_reference_timestamp_meta (*buf, src->squeeze_frame_caps, paint_rt, GST_CLOCK_TIME_NONE);
+      src->ft_squeeze++;
+    }
   } else {
     *buf = gst_buffer_copy (src->current_buffer);
   }
@@ -1515,7 +1529,7 @@ gst_cef_src_start(GstBaseSrc *base_src)
   src->paint_seq = 0;
   src->fl_frames = src->fl_timeouts = src->fl_dropped_requests = 0;
   src->fl_paint_us_sum = src->fl_paint_us_max = src->fl_begin_frame_at = 0;
-  src->ft_exact = src->ft_stale = src->ft_ahead = src->ft_untagged = src->ft_unpaired = src->ft_unstamped = 0;
+  src->ft_exact = src->ft_stale = src->ft_ahead = src->ft_untagged = src->ft_unpaired = src->ft_unstamped = src->ft_squeeze = 0;
   src->last_tagged_us = src->last_untagged_us = 0;
   GST_OBJECT_UNLOCK (src);
 
@@ -1958,6 +1972,7 @@ gst_cef_src_finalize (GObject *object)
 
   g_queue_free_full (src->frame_requests, g_free);
   gst_caps_unref (src->paint_frame_caps);
+  gst_caps_unref (src->squeeze_frame_caps);
   g_cond_clear (&src->frame_cond);
 
   g_cond_clear(&src->state_cond);
@@ -1997,6 +2012,7 @@ gst_cef_src_init (GstCefSrc * src)
   src->tag_count = 0;
   memset (&src->tag_times, 0, sizeof (src->tag_times));
   src->paint_frame_caps = gst_caps_new_empty_simple (GST_CEF_PAINT_FRAME_CAPS);
+  src->squeeze_frame_caps = gst_caps_new_empty_simple (GST_CEF_SQUEEZE_FRAME_CAPS);
   g_cond_init (&src->frame_cond);
   src->paint_seq = 0;
   src->flushing = FALSE;
@@ -2114,7 +2130,9 @@ gst_cef_src_class_init (GstCefSrcClass * klass)
           "stamped with the requested running time. A paired buffer whose paint's tag was "
           "requested within the last FRAME_TAG_TIMES (64) requests also carries a "
           "GstReferenceTimestampMeta (timestamp/x-ligr-paint-frame) with the running time "
-          "of the frame its paint shows. The browser paints freely. While paints come "
+          "of the frame its paint shows. A paint with a squeeze tag at the bottom left "
+          "adds a second one (timestamp/x-ligr-squeeze-frame) for the frame that tag names. "
+          "The browser paints freely. While paints come "
           "without a readable tag, the newest paint goes out unpaired, with no such meta.",
           FALSE,
           (GParamFlags) (G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY)));

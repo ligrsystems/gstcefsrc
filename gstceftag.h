@@ -51,14 +51,11 @@ gst_cef_frame_tag_bits (const uint8_t *px)
   return bits;
 }
 
-/* The tag at the bottom right of a BGRA frame `w` x `h`, or -1 when it is
+/* The tag in the FRAME_TAG_PIXELS BGRA pixels at `row`, or -1 when it is
  * absent, covered or blended. */
 static inline int64_t
-gst_cef_read_frame_tag (const uint8_t *bgra, int w, int h)
+gst_cef_read_tag_pixels (const uint8_t *row)
 {
-  if (w < FRAME_TAG_PIXELS || h < 1)
-    return -1;
-  const uint8_t *row = bgra + ((size_t) (h - 1) * w + (w - FRAME_TAG_PIXELS)) * 4;
   if (row[0] < 200 || row[1] > 55 || row[2] < 200 || row[3] < 200)
     return -1;
   uint32_t tag = 0, check = 0;
@@ -72,6 +69,31 @@ gst_cef_read_frame_tag (const uint8_t *bgra, int w, int h)
       check |= (uint32_t) bits << (3 * (j - 8));
   }
   return check == gst_cef_frame_tag_check (tag) ? (int64_t) tag : -1;
+}
+
+/* The tag at the bottom right of a BGRA frame `w` x `h`, or -1 when it is
+ * absent, covered or blended. */
+static inline int64_t
+gst_cef_read_frame_tag (const uint8_t *bgra, int w, int h)
+{
+  if (w < FRAME_TAG_PIXELS || h < 1)
+    return -1;
+  return gst_cef_read_tag_pixels (bgra + ((size_t) (h - 1) * w + (w - FRAME_TAG_PIXELS)) * 4);
+}
+
+/* The squeeze tag. While a graphic claims a squeeze, the graphic's own frame
+ * draws the tag of the data frame it shows at the bottom left of every paint,
+ * in the same format. Each frame of a page paints on its own schedule, so the
+ * squeeze tag can name an older frame than the frame tag; the box places the
+ * video for the squeeze tag's frame, where that graphic drew around it.
+ * Returns -1 when it is absent, covered or blended, or the frame is too
+ * narrow for both tags. */
+static inline int64_t
+gst_cef_read_squeeze_tag (const uint8_t *bgra, int w, int h)
+{
+  if (w < 2 * FRAME_TAG_PIXELS || h < 1)
+    return -1;
+  return gst_cef_read_tag_pixels (bgra + (size_t) (h - 1) * w * 4);
 }
 
 /* The running time each recent tagged request asked for, by tag. Frame-tag
