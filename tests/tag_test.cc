@@ -160,6 +160,11 @@ main ()
     uint8_t *px = f.data () + ((H - 1) * W + 3) * 4;
     px[3] = 128;
     CHECK (gst_cef_read_squeeze_tag (f.data (), W, H) == -1, "a translucent squeeze tag pixel reads");
+    std::vector<uint8_t> touching (22 * 1 * 4, 0);
+    draw_tag (touching.data (), 0x000104);
+    draw_tag (touching.data () + 11 * 4, 0x000105);
+    CHECK (gst_cef_read_squeeze_tag (touching.data (), 22, 1) == 0x000104, "a squeeze tag beside the frame tag in 22 px");
+    CHECK (gst_cef_read_frame_tag (touching.data (), 22, 1) == 0x000105, "a frame tag beside the squeeze tag in 22 px");
     std::vector<uint8_t> narrow (21 * 1 * 4, 0);
     draw_tag (narrow.data (), 0x000104);
     CHECK (gst_cef_read_squeeze_tag (narrow.data (), 21, 1) == -1, "a squeeze tag reads where it would overlap the frame tag");

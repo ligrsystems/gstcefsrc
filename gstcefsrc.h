@@ -112,8 +112,10 @@ struct _GstCefSrc {
   /* Paired frames sent without a paint-frame time: the paint's tag was not
    * among the recent requests (gst_cef_tag_times_get). */
   guint64 ft_unstamped;
-  /* Paired frames stamped with a squeeze-frame time. */
+  /* Paired frames stamped with a squeeze-frame time, and paired frames whose
+   * squeeze tag was not among the recent requests. */
   guint64 ft_squeeze;
+  guint64 ft_squeeze_unstamped;
   /* The running time each recent tag was requested for. Every paired output
    * buffer carries a GstReferenceTimestampMeta (caps GST_CEF_PAINT_FRAME_CAPS)
    * with the running time of the frame its paint shows, so a downstream
