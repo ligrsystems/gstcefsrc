@@ -96,6 +96,11 @@ struct _GstCefSrc {
   guint64 ft_stale;
   guint64 ft_ahead;
   guint64 ft_untagged;
+  /* Frames sent unpaired: paints kept coming without a readable tag. */
+  guint64 ft_unpaired;
+  /* Monotonic time of the last paint with and without a readable tag. */
+  gint64 last_tagged_us;
+  gint64 last_untagged_us;
   CefRefPtr<CefBrowser> browser;
   CefRefPtr<CefApp> app;
 
