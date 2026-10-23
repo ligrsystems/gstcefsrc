@@ -201,7 +201,7 @@ jobs:
           # speaks the same API, so only the endpoint changes.
           ANTHROPIC_BASE_URL: https://openrouter.ai/api
         with:
-          anthropic_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+          anthropic_api_key: ${{ secrets.OPENROUTER_KEY_WALKTHROUGH }}
           prompt: |
             You are generating the reviewer-orientation comment for pull request
             #${{ github.event.pull_request.number || inputs.pr_number }} in ${{ github.repository }}.
