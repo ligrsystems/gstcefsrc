@@ -11,9 +11,10 @@ name: do-not-merge
 #
 # The labeled and unlabeled events re-run this workflow, so the check
 # follows the label at once. When a commit has more than one
-# pr/do-not-merge check run, GitHub obeys the newest one, even if an
-# older run finishes later. So there is no concurrency group: a group
-# made the newest run wait behind a slow runner (tested 3 Nov 2026).
+# pr/do-not-merge run, GitHub obeys the run of the newest workflow
+# run, even if an older run finishes later. So there is no
+# concurrency group: a group made the newest run wait behind a slow
+# runner (tested 3 Nov 2026).
 #
 # FORGEABLE (interim): a pull_request run uses the PR's own copy of
 # this file, so a PR can edit the file to pass its own check. This
@@ -21,9 +22,15 @@ name: do-not-merge
 # replacement posts the check from a GitHub App whose key only the
 # default branch can use, and the ruleset pins the check to that App.
 #
-# Re-stamp: Actions > do-not-merge > Run workflow sets the check on
-# every open PR from its current labels. Use it for PRs opened before
-# this workflow existed, or for a PR whose check is missing.
+# Shared head commit: the check belongs to a commit. If two open PRs
+# have the same head commit and only one has the label, an event on
+# the other PR passes the commit for both. To block it again, remove
+# and re-add the label on the labelled PR.
+#
+# Backfill: Actions > do-not-merge > Run workflow adds the check to
+# each open PR that has none (for example, a PR opened before this
+# workflow existed). It reads the current labels. It does not change
+# a commit that already has the check.
 #
 # This file is identical in every ligrsystems repo. Change all copies
 # together.
@@ -51,20 +58,29 @@ jobs:
           echo "::error::This PR has the do-not-merge label. Read the '**do-not-merge: reason**' comment on the PR. Remove the label to unblock the merge."
           exit 1
 
-      - name: Stamp the check on every open PR
+      - name: Add the check to open PRs that have none
         if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          for pr in $(gh pr list --state open --limit 1000 --json number --jq '.[].number'); do
-            # Read the labels per PR, just before the stamp, to keep the
+          # The check belongs to a commit, not to a PR. If any open PR
+          # whose head is this commit has the label, the commit fails.
+          for sha in $(gh pr list --state open --limit 1000 --json headRefOid \
+              --jq '[.[].headRefOid] | unique | .[]'); do
+            has=$(gh api "repos/$GH_REPO/commits/$sha/check-runs?check_name=pr/do-not-merge&filter=all" \
+              --jq .total_count)
+            if [ "$has" != 0 ]; then
+              echo "$sha has the check"
+              continue
+            fi
+            # Read the labels again just before each post, to keep the
             # race with a concurrent label change short.
-            row=$(gh pr view "$pr" --json headRefOid,labels \
-              --jq '[.headRefOid, (any(.labels[]; .name == "do-not-merge") | tostring)] | @tsv')
-            sha=${row%%$'\t'*}
-            if [ "${row##*$'\t'}" = true ]; then
+            blocked=$(gh pr list --state open --limit 1000 --json headRefOid,labels |
+              jq -r --arg sha "$sha" \
+                '[.[] | select(.headRefOid == $sha and any(.labels[]; .name == "do-not-merge"))] | length > 0')
+            if [ "$blocked" = true ]; then
               conclusion=failure; title="do-not-merge label is set"
             else
               conclusion=success; title="No do-not-merge label"
@@ -73,6 +89,6 @@ jobs:
               -f name=pr/do-not-merge -f head_sha="$sha" \
               -f status=completed -f conclusion="$conclusion" \
               -f "output[title]=$title" \
-              -f "output[summary]=Stamped by the do-not-merge workflow re-stamp run."
-            echo "#$pr $sha $conclusion"
+              -f "output[summary]=Added by the do-not-merge backfill run."
+            echo "$sha $conclusion"
           done
