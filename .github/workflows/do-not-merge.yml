@@ -1,0 +1,78 @@
+name: do-not-merge
+
+# Required check `pr/do-not-merge`. It fails while the PR has the
+# `do-not-merge` label and passes as soon as the label is removed.
+# A ruleset on the default branch requires it, with no bypass, so
+# nobody can merge past the label. To merge, remove the label.
+#
+# Cost: the job runs (and fails) only while the label is set. Without
+# the label the job is skipped. A skipped job uses no runner minutes,
+# and GitHub counts it as passing for a required check.
+#
+# The labeled and unlabeled events re-run this workflow, so the check
+# follows the label at once. When a commit has more than one
+# pr/do-not-merge check run, GitHub obeys the newest one, even if an
+# older run finishes later. So there is no concurrency group: a group
+# made the newest run wait behind a slow runner (tested 3 Nov 2026).
+#
+# FORGEABLE (interim): a pull_request run uses the PR's own copy of
+# this file, so a PR can edit the file to pass its own check. This
+# stops accidental merges, not deliberate ones. The planned
+# replacement posts the check from a GitHub App whose key only the
+# default branch can use, and the ruleset pins the check to that App.
+#
+# Re-stamp: Actions > do-not-merge > Run workflow sets the check on
+# every open PR from its current labels. Use it for PRs opened before
+# this workflow existed, or for a PR whose check is missing.
+#
+# This file is identical in every ligrsystems repo. Change all copies
+# together.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  do-not-merge:
+    name: pr/do-not-merge
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'do-not-merge')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      checks: write
+      pull-requests: read
+    steps:
+      - name: Block the merge
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "::error::This PR has the do-not-merge label. Read the '**do-not-merge: reason**' comment on the PR. Remove the label to unblock the merge."
+          exit 1
+
+      - name: Stamp the check on every open PR
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for pr in $(gh pr list --state open --limit 1000 --json number --jq '.[].number'); do
+            # Read the labels per PR, just before the stamp, to keep the
+            # race with a concurrent label change short.
+            row=$(gh pr view "$pr" --json headRefOid,labels \
+              --jq '[.headRefOid, (any(.labels[]; .name == "do-not-merge") | tostring)] | @tsv')
+            sha=${row%%$'\t'*}
+            if [ "${row##*$'\t'}" = true ]; then
+              conclusion=failure; title="do-not-merge label is set"
+            else
+              conclusion=success; title="No do-not-merge label"
+            fi
+            gh api "repos/$GH_REPO/check-runs" --silent \
+              -f name=pr/do-not-merge -f head_sha="$sha" \
+              -f status=completed -f conclusion="$conclusion" \
+              -f "output[title]=$title" \
+              -f "output[summary]=Stamped by the do-not-merge workflow re-stamp run."
+            echo "#$pr $sha $conclusion"
+          done
